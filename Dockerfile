@@ -24,6 +24,10 @@ ENV PATH="/app:${PATH}" \
     LD_LIBRARY_PATH="/app:${LD_LIBRARY_PATH}"
 
 # Python deps (torch from the CUDA 12.4 wheel index, then the rest).
+# The base is Ubuntu 24.04 / Python 3.12 with PEP-668 "externally managed"
+# protection; inside a container we install system-wide on purpose.
+ENV PIP_BREAK_SYSTEM_PACKAGES=1 \
+    PIP_ROOT_USER_ACTION=ignore
 COPY requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir --upgrade pip \
     && pip3 install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu124 \
