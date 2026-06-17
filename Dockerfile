@@ -29,8 +29,9 @@ ENV PATH="/app:${PATH}" \
 ENV PIP_BREAK_SYSTEM_PACKAGES=1 \
     PIP_ROOT_USER_ACTION=ignore
 COPY requirements.txt /tmp/requirements.txt
-RUN pip3 install --no-cache-dir --upgrade pip \
-    && pip3 install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu124 \
+# Note: do NOT `--upgrade pip` here — the distro pip has no RECORD file and the
+# self-upgrade fails. The packaged pip installs wheels fine.
+RUN pip3 install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu124 \
     && pip3 install --no-cache-dir -r /tmp/requirements.txt supervisor
 
 # Our services (kept out of /app so they don't mix with llama.cpp binaries).
