@@ -11,7 +11,16 @@ if [[ "${1:-}" == "llama" ]]; then
     # error. KV-cache quantisation (q8_0) roughly halves cache VRAM.
     PERF_ARGS="${LLM_PERF_ARGS:---flash-attn --cache-type-k q8_0 --cache-type-v q8_0}"
 
-    exec llama-server \
+    # Locate the llama-server binary (the official base image ships it in /app).
+    LLAMA_BIN="$(command -v llama-server || true)"
+    if [[ -z "${LLAMA_BIN}" ]]; then
+        for p in /app/llama-server /usr/local/bin/llama-server /llama-server; do
+            [[ -x "$p" ]] && LLAMA_BIN="$p" && break
+        done
+    fi
+    : "${LLAMA_BIN:?llama-server binary not found}"
+
+    exec "${LLAMA_BIN}" \
         -hf "${LLM_HF_REPO:-google/gemma-4-12B-it-qat-q4_0-gguf}:${LLM_HF_QUANT:-Q4_0}" \
         --host 127.0.0.1 --port 8081 \
         --alias "${LLM_MODEL_NAME:-gemma-4-12b}" \

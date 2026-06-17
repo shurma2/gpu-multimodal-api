@@ -149,9 +149,10 @@ All behaviour is env-driven — see [.env.example](.env.example). Key knobs:
 
 ## Notes & caveats
 
-- **Bleeding edge.** Gemma 4 and Qwen3-TTS are recent. The image builds
-  `llama.cpp` from `master` (`LLAMA_CPP_REF`) for newest model support. If
-  `--flash-attn` fails to parse on a very new build, set
+- **Bleeding edge.** Gemma 4 and Qwen3-TTS are recent. The image is built on the
+  official `ghcr.io/ggml-org/llama.cpp:server-cuda` (override via the `LLAMA_IMAGE`
+  build arg / pin a tag for reproducibility). If `--flash-attn` fails to parse on
+  a very new build, set
   `LLM_PERF_ARGS="--flash-attn on --cache-type-k q8_0 --cache-type-v q8_0"`.
 - **Native TTS streaming** is used automatically if the installed `qwen-tts`
   exposes `generate_custom_voice(stream=True)`; otherwise the service falls back
@@ -160,5 +161,5 @@ All behaviour is env-driven — see [.env.example](.env.example). Key knobs:
 - **Concurrency.** TTS GPU calls are serialised with a lock (one TTS request at
   a time); the LLM handles `LLM_PARALLEL` concurrent slots. Scale TTS by running
   more replicas behind the gateway.
-- **GPU build targets** Turing→Ada (`CUDA_ARCHS=75;80;86;89`). Add older archs
-  in the Dockerfile if your rented card is older.
+- **GPU arch coverage** comes from the official llama.cpp image (broad
+  Turing→Ada+ support); the PyTorch TTS wheel covers the same range.
