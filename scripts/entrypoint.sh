@@ -9,7 +9,7 @@ if [[ "${1:-}" == "llama" ]]; then
     # Performance/VRAM knobs. On very new llama.cpp builds flash-attn takes a
     # value (e.g. "--flash-attn on"); override LLM_PERF_ARGS if you hit a parse
     # error. KV-cache quantisation (q8_0) roughly halves cache VRAM.
-    PERF_ARGS="${LLM_PERF_ARGS:---flash-attn --cache-type-k q8_0 --cache-type-v q8_0}"
+    PERF_ARGS="${LLM_PERF_ARGS:---flash-attn on --cache-type-k q8_0 --cache-type-v q8_0}"
 
     # Locate the llama-server binary (the official base image ships it in /app).
     LLAMA_BIN="$(command -v llama-server || true)"
