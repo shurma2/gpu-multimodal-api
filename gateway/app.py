@@ -90,6 +90,23 @@ async def health():
     )
 
 
+@app.get("/debug/logs")
+async def debug_logs(authorization: Optional[str] = Header(None), lines: int = 80):
+    """Tail the llama/tts process logs (written to /models/*.log) over HTTP, so
+    the backends can be diagnosed without shell access to the container."""
+    _auth(authorization)
+    out = {}
+    for name, path in (("llama", "/models/llama.log"), ("tts", "/models/tts.log")):
+        try:
+            with open(path, "r", errors="replace") as f:
+                out[name] = f.read().splitlines()[-int(lines):]
+        except FileNotFoundError:
+            out[name] = ["<no log yet>"]
+        except Exception as e:  # noqa: BLE001
+            out[name] = [f"<error reading log: {e}>"]
+    return out
+
+
 @app.get("/v1/models")
 async def models(authorization: Optional[str] = Header(None)):
     _auth(authorization)

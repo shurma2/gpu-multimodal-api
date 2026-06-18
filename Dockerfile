@@ -23,7 +23,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git cmake ninja-build build-essential ca-certificates \
-        libcurl4-openssl-dev \
+        libcurl4-openssl-dev libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # The devel image ships only the CUDA driver *stub* (libcuda.so); the real
@@ -38,6 +38,7 @@ RUN cmake -S /src/llama.cpp -B /src/build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DGGML_CUDA=ON \
         -DLLAMA_CURL=ON \
+        -DLLAMA_OPENSSL=ON \
         -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_EXAMPLES=OFF \
