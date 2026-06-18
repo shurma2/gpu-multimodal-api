@@ -76,7 +76,37 @@ class TTSEngine:
         )
         self._lock = threading.Lock()
         self.sample_rate: Optional[int] = None
+        self._optimize(torch)
         self._warmup()
+
+    def _optimize(self, torch) -> None:
+        """Speed up autoregressive decode. The bottleneck for a 0.6B model is
+        kernel-launch overhead (the GPU starves waiting for the CPU to dispatch
+        thousands of tiny ops per step), so torch.compile (CUDA graphs) is the
+        big lever. Best-effort: any failure falls back to plain eager mode."""
+        try:
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception as e:  # noqa: BLE001
+            print(f"[tts] tf32 setup skipped: {e}", flush=True)
+
+        if os.environ.get("TTS_COMPILE", "1") != "1":
+            print("[tts] torch.compile disabled (TTS_COMPILE!=1)", flush=True)
+            return
+        mode = os.environ.get("TTS_COMPILE_MODE", "reduce-overhead")
+        # Compile the inner generation nn.Module (the hot per-step path). The
+        # qwen-tts wrapper holds the real network under one of these attrs.
+        for attr in ("model", "lm", "backbone", "transformer", "llm", "net"):
+            sub = getattr(self.model, attr, None)
+            if isinstance(sub, torch.nn.Module):
+                try:
+                    setattr(self.model, attr, torch.compile(sub, mode=mode))
+                    print(f"[tts] torch.compile applied to .{attr} (mode={mode})", flush=True)
+                    return
+                except Exception as e:  # noqa: BLE001
+                    print(f"[tts] torch.compile on .{attr} failed: {e}", flush=True)
+        print("[tts] torch.compile: no compatible submodule found; eager mode", flush=True)
 
     def _warmup(self) -> None:
         """Run one tiny synthesis so the first real request is fast and so we
