@@ -65,15 +65,19 @@ COPY --from=llama-builder /opt/llama/bin /opt/llama/bin
 ENV PATH="/opt/llama/bin:${PATH}" \
     LD_LIBRARY_PATH="/opt/llama/bin:${LD_LIBRARY_PATH}"
 
-# Python deps. torch AND torchaudio MUST come from the same CUDA 12.4 index, or
-# torchaudio's native ext fails to load (libcudart.so.NN mismatch). The extra
-# index makes pip prefer +cu124 wheels for any later torch/torchaudio pulls too.
+# Python deps.
+#  - torch + torchaudio strictly from the CUDA 12.4 index (--index-url, not
+#    extra) so we get a matching cu124 pair (mismatched torchaudio loads the
+#    wrong libcudart and crashes).
+#  - numpy + setuptools up front, then --no-build-isolation: the `sox` sdist
+#    (pulled in by qwen-tts) imports numpy in its setup.py, which fails under
+#    pip's default build isolation.
 ENV PIP_BREAK_SYSTEM_PACKAGES=1 \
-    PIP_ROOT_USER_ACTION=ignore \
-    PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu124
+    PIP_ROOT_USER_ACTION=ignore
 COPY requirements.txt /tmp/requirements.txt
-RUN pip3 install --no-cache-dir torch torchaudio \
-    && pip3 install --no-cache-dir -r /tmp/requirements.txt supervisor
+RUN pip3 install --no-cache-dir --index-url https://download.pytorch.org/whl/cu124 torch torchaudio \
+    && pip3 install --no-cache-dir "numpy<2.0" setuptools wheel \
+    && pip3 install --no-cache-dir --no-build-isolation -r /tmp/requirements.txt supervisor
 
 # Our services (kept out of /opt/llama).
 WORKDIR /opt/app
