@@ -3,7 +3,10 @@ set -euo pipefail
 
 if [[ "${1:-}" == "llama" ]]; then
     PERF_ARGS="${LLM_PERF_ARGS:---flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --no-mmproj}"
-    FIT_ARGS="${LLM_FIT_ARGS:-}"
+    # Auto memory-fit ("-fit on", the upstream default) segfaults on this build
+    # while "fitting params to device memory", crash-looping llama-server. All
+    # layers already fit on the 3090 Ti via -ngl 99, so disable the fitter.
+    FIT_ARGS="${LLM_FIT_ARGS:--fit off}"
 
     LLAMA_BIN="$(command -v llama-server || true)"
     : "${LLAMA_BIN:?llama-server binary not found}"
