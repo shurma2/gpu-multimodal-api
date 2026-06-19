@@ -50,9 +50,13 @@ RUN cmake -S /src/llama.cpp -B /src/build -G Ninja \
 # "libcudart.so.12: cannot open shared object file". Ship the exact CUDA 12.4
 # runtime libraries llama-server linked against. libcuda.so (the driver) is NOT
 # copied — it is injected from the host by the NVIDIA Container Toolkit.
+# libnccl.so.2 is linked in too (multi-GPU collectives) and lives outside
+# lib64 in this image, so it is located with find rather than a fixed path.
 RUN cp -av /usr/local/cuda/lib64/libcudart.so*   /opt/llama/lib/ \
     && cp -av /usr/local/cuda/lib64/libcublas.so*   /opt/llama/lib/ \
-    && cp -av /usr/local/cuda/lib64/libcublasLt.so* /opt/llama/lib/
+    && cp -av /usr/local/cuda/lib64/libcublasLt.so* /opt/llama/lib/ \
+    && find / -name 'libnccl.so*' -not -path '/opt/llama/*' \
+        -exec cp -av {} /opt/llama/lib/ \;
 
 # --------------------------------------------------------------------------- #
 # Stage 2 - runtime
