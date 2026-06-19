@@ -9,8 +9,14 @@ Public surface:
     POST /v1/audio/transcriptions   -> Nemotron Speech STT
     POST /v1/audio/vad              -> Silero VAD ONNX
     POST /v1/audio/turn             -> Pipecat Smart Turn v3
-    WS   /v1/audio/stream           -> PCM16 audio stream with VAD/turn/STT
+    WS   /v1/audio/stream           -> unified VAD + end-of-turn + STT channel
     POST /v1/voice/chat             -> LLM reply synthesized to speech
+
+The WebSocket channel binds VAD, end-of-turn detection and STT into a single
+event stream. The client streams raw PCM16 mono 16 kHz audio (binary frames)
+and receives JSON events. The important one is `end_of_turn`: it carries the
+final transcript and tells the consumer the speaker has finished, so it can
+stop listening and hand the text to the LLM. See README.md for the protocol.
 """
 
 from __future__ import annotations
@@ -178,7 +184,6 @@ async def debug_logs(authorization: Optional[str] = Header(None), lines: int = 8
     for name, path in (
         ("api", "/models/api.log"),
         ("llm", "/models/llama.log"),
-        ("tts", "/models/tts.log"),
     ):
         try:
             with open(path, "r", errors="replace") as f:
@@ -354,6 +359,24 @@ async def audio_turn(
 
 @app.websocket("/v1/audio/stream")
 async def audio_stream(websocket: WebSocket):
+    """Unified VAD + end-of-turn + STT channel.
+
+    Client -> server:
+        - binary frames: raw PCM16 mono little-endian at `sample_rate` (16 kHz)
+        - text frames (JSON): {"type": "commit"} force end-of-turn now,
+                              {"type": "reset"}  drop the buffered utterance,
+                              {"type": "ping"}   liveness/readiness check
+
+    Server -> client (all JSON, single channel):
+        - {"type": "ready", ...}        handshake with models + audio format
+        - {"type": "speech_started"}    VAD detected the user started talking
+        - {"type": "speech_stopped"}    VAD detected the user went quiet
+        - {"type": "end_of_turn", "text": ..., "complete": true, ...}
+              the turn finished: final transcript is attached and the consumer
+              should stop listening and act on `text`
+        - {"type": "pong", "stt": ...}  reply to ping with the STT load state
+        - {"type": "error", "error": ...}
+    """
     if not await _auth_ws(websocket):
         return
     await websocket.accept()
@@ -363,16 +386,39 @@ async def audio_stream(websocket: WebSocket):
     vad = service.create_vad(sample_rate)
     turn = service.create_turn_analyzer(sample_rate)
     speech_buffer = bytearray()
-    last_vad_state: Optional[str] = None
+    speaking = False
+
+    async def emit_end_of_turn(reason: str, metrics=None) -> None:
+        """Transcribe the buffered utterance and emit the single end-of-turn
+        event, then reset for the next turn."""
+        nonlocal speaking
+        text = ""
+        if speech_buffer:
+            audio = pcm16_bytes_to_float(bytes(speech_buffer))
+            text = await get_stt().transcribe_audio(audio, sample_rate)
+        payload = {
+            "type": "end_of_turn",
+            "text": text,
+            "complete": True,
+            "reason": reason,
+            "probability": getattr(metrics, "probability", None) if metrics else None,
+            "processing_ms": getattr(metrics, "e2e_processing_time_ms", None) if metrics else None,
+        }
+        await websocket.send_json(payload)
+        speech_buffer.clear()
+        turn.clear()
+        speaking = False
 
     await websocket.send_json(
         {
             "type": "ready",
             "sample_rate": sample_rate,
             "encoding": "pcm_s16le",
-            "vad_model": settings.vad_model_name,
-            "turn_model": settings.turn_model_name,
-            "stt_model": settings.stt_model_name,
+            "models": {
+                "vad": settings.vad_model_name,
+                "turn": settings.turn_model_name,
+                "stt": settings.stt_model_name,
+            },
         }
     )
 
@@ -398,27 +444,15 @@ async def audio_stream(websocket: WebSocket):
                 if turn.speech_triggered and vad_name == "quiet":
                     turn_state, metrics = await turn.analyze_end_of_turn()
 
-                if vad_name != last_vad_state:
-                    await websocket.send_json({"type": "vad", "state": vad_name})
-                    last_vad_state = vad_name
+                if is_speech and not speaking:
+                    speaking = True
+                    await websocket.send_json({"type": "speech_started"})
+                elif not is_speech and speaking and vad_name == "quiet":
+                    speaking = False
+                    await websocket.send_json({"type": "speech_stopped"})
 
                 if turn_state.name.lower() == "complete" and speech_buffer:
-                    audio = pcm16_bytes_to_float(bytes(speech_buffer))
-                    text = await get_stt().transcribe_audio(audio, sample_rate)
-                    payload = {
-                        "type": "transcript",
-                        "final": True,
-                        "text": text,
-                    }
-                    if metrics is not None:
-                        payload["turn"] = {
-                            "complete": getattr(metrics, "is_complete", True),
-                            "probability": getattr(metrics, "probability", None),
-                            "processing_ms": getattr(metrics, "e2e_processing_time_ms", None),
-                        }
-                    await websocket.send_json(payload)
-                    speech_buffer.clear()
-                    turn.clear()
+                    await emit_end_of_turn("vad", metrics)
                 continue
 
             text_message = message.get("text")
@@ -434,16 +468,14 @@ async def audio_stream(websocket: WebSocket):
             if action == "reset":
                 speech_buffer.clear()
                 turn.clear()
+                speaking = False
                 await websocket.send_json({"type": "reset"})
-            elif action == "commit":
-                if not speech_buffer:
-                    await websocket.send_json({"type": "transcript", "final": True, "text": ""})
-                    continue
-                audio = pcm16_bytes_to_float(bytes(speech_buffer))
-                text = await get_stt().transcribe_audio(audio, sample_rate)
-                await websocket.send_json({"type": "transcript", "final": True, "text": text})
-                speech_buffer.clear()
-                turn.clear()
+            elif action in ("commit", "flush"):
+                await emit_end_of_turn("commit")
+            elif action == "ping":
+                await websocket.send_json(
+                    {"type": "pong", "stt": get_stt().status, "speaking": speaking}
+                )
             else:
                 await websocket.send_json({"type": "error", "error": f"unknown action '{action}'"})
     finally:

@@ -2,6 +2,17 @@ name: build-and-push
 
 # Builds the linux/amd64 CUDA image on GitHub's runners and pushes it to
 # Docker Hub. Runs on every push to main, or manually via the Actions tab.
+#
+# Caching: the two slow stages are the llama.cpp CUDA build (~15 min) and the
+# torch/NeMo pip install. GitHub Actions does not keep a Docker layer cache
+# between runs by default, so without help every push rebuilds them from
+# scratch. We use buildx registry cache (mode=max) stored in a dedicated
+# `:buildcache` tag on Docker Hub. Because the llama.cpp ref and
+# requirements.txt change rarely, those layers are restored from the registry
+# and only the gateway/app code is rebuilt. A registry cache is preferred over
+# committing a cache folder to the repo (multi-GB binaries do not belong in
+# git) and over GitHub's `type=gha` cache (10 GB limit is too small for the
+# CUDA + torch layers here).
 
 on:
   push:
@@ -45,4 +56,6 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:1.0
             ${{ env.IMAGE }}:latest
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
           provenance: false

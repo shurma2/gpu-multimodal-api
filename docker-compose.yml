@@ -10,13 +10,13 @@ services:
       HUGGINGFACE_HUB_CACHE: /models/hf-cache/hub
     command:
       - -hf
-      - ${LLM_HF_REPO:-google/gemma-3-12b-it-qat-q4_0-gguf}:${LLM_HF_QUANT:-Q4_0}
+      - ${LLM_HF_REPO:-google/gemma-4-12B-it-qat-q4_0-gguf}:${LLM_HF_QUANT:-Q4_0}
       - --host
       - 0.0.0.0
       - --port
       - "8080"
       - --alias
-      - ${LLM_MODEL_NAME:-gemma-3-12b}
+      - ${LLM_MODEL_NAME:-gemma-4-12b}
       - -ngl
       - ${LLM_GPU_LAYERS:-99}
       - -c
@@ -30,6 +30,7 @@ services:
       - q8_0
       - --cache-type-v
       - q8_0
+      - --no-mmproj
     volumes:
       - hf-cache:/models/hf-cache
     shm_size: "2gb"

@@ -19,8 +19,8 @@ class Settings(BaseSettings):
     api_key: str = ""
     gateway_timeout: float = 600.0
 
-    llm_base_url: str = "http://llm:8080"
-    llm_model_name: str = "gemma-3-12b"
+    llm_base_url: str = "http://127.0.0.1:8081"
+    llm_model_name: str = "gemma-4-12b"
 
     tts_model_name: str = "kokoro"
     tts_default_speaker: str = "am_michael"
