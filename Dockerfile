@@ -8,6 +8,7 @@
 
 ARG CUDA_VERSION=12.4.1
 ARG UBUNTU=ubuntu22.04
+ARG PYTORCH_IMAGE=pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime
 
 # --------------------------------------------------------------------------- #
 # Stage 1 - build llama.cpp with CUDA
@@ -46,7 +47,6 @@ RUN cmake -S /src/llama.cpp -B /src/build -G Ninja \
 # --------------------------------------------------------------------------- #
 # Stage 2 - runtime
 # --------------------------------------------------------------------------- #
-ARG PYTORCH_IMAGE=pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime
 FROM ${PYTORCH_IMAGE} AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
