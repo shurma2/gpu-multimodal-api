@@ -56,7 +56,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU} AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip \
-        ffmpeg sox libsox-fmt-all \
+        ffmpeg espeak-ng \
         libcurl4 libgomp1 curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3 /usr/bin/python
@@ -66,19 +66,13 @@ COPY --from=llama-builder /opt/llama/bin /opt/llama/bin
 ENV PATH="/opt/llama/bin:${PATH}" \
     LD_LIBRARY_PATH="/opt/llama/bin:${LD_LIBRARY_PATH}"
 
-# Python deps.
-#  - torch + torchaudio strictly from the CUDA 12.4 index (--index-url, not
-#    extra) so we get a matching cu124 pair (mismatched torchaudio loads the
-#    wrong libcudart and crashes).
-#  - numpy + setuptools up front, then --no-build-isolation: the `sox` sdist
-#    (pulled in by qwen-tts) imports numpy in its setup.py, which fails under
-#    pip's default build isolation.
+# Python deps. torch strictly from the CUDA 12.4 index so it matches the host
+# driver; Kokoro + the API deps from PyPI. (Kokoro doesn't need torchaudio.)
 ENV PIP_BREAK_SYSTEM_PACKAGES=1 \
     PIP_ROOT_USER_ACTION=ignore
 COPY requirements.txt /tmp/requirements.txt
-RUN pip3 install --no-cache-dir --index-url https://download.pytorch.org/whl/cu124 torch torchaudio \
-    && pip3 install --no-cache-dir "numpy<2.0" setuptools wheel \
-    && pip3 install --no-cache-dir --no-build-isolation -r /tmp/requirements.txt supervisor
+RUN pip3 install --no-cache-dir --index-url https://download.pytorch.org/whl/cu124 torch \
+    && pip3 install --no-cache-dir -r /tmp/requirements.txt supervisor
 
 # Our services (kept out of /opt/llama).
 WORKDIR /opt/app
@@ -92,8 +86,8 @@ ENV HF_HOME=/models/hf-cache \
     LLM_BASE_URL=http://127.0.0.1:8081 \
     TTS_BASE_URL=http://127.0.0.1:8082 \
     LLM_MODEL_NAME=gemma-4-12b \
-    TTS_MODEL_NAME=qwen3-tts \
-    TTS_DEFAULT_SPEAKER=Ryan \
+    TTS_MODEL_NAME=kokoro \
+    TTS_DEFAULT_SPEAKER=am_michael \
     TTS_DEFAULT_LANGUAGE=English
 
 EXPOSE 8000

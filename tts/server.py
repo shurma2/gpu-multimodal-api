@@ -25,7 +25,7 @@ import soundfile as sf
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from .engine import SPEAKERS, TTSEngine
+from .engine import ENGLISH_VOICES, SPEAKERS, TTSEngine
 
 TTS_MODEL_NAME = os.environ.get("TTS_MODEL_NAME", "qwen3-tts")
 
@@ -157,7 +157,7 @@ async def voices():
         "default": engine.default_speaker if engine else None,
         "language": engine.default_language if engine else None,
         "voices": sorted(SPEAKERS),
-        "english_voices": ["Ryan", "Aiden"],
+        "english_voices": ENGLISH_VOICES,
     }
 
 
