@@ -91,7 +91,10 @@ class TTSEngine:
         except Exception as e:  # noqa: BLE001
             print(f"[tts] tf32 setup skipped: {e}", flush=True)
 
-        if os.environ.get("TTS_COMPILE", "1") != "1":
+        # Default OFF: on the custom qwen-tts generate loop, reduce-overhead /
+        # CUDA graphs recompile on every changing shape and end up ~2x SLOWER.
+        # Opt in with TTS_COMPILE=1 (and ideally TTS_COMPILE_MODE=default).
+        if os.environ.get("TTS_COMPILE", "0") != "1":
             print("[tts] torch.compile disabled (TTS_COMPILE!=1)", flush=True)
             return
         mode = os.environ.get("TTS_COMPILE_MODE", "reduce-overhead")
