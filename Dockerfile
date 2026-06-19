@@ -46,16 +46,20 @@ RUN cmake -S /src/llama.cpp -B /src/build -G Ninja \
 # --------------------------------------------------------------------------- #
 # Stage 2 - runtime
 # --------------------------------------------------------------------------- #
-FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU} AS runtime
+ARG PYTORCH_IMAGE=pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime
+FROM ${PYTORCH_IMAGE} AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-dev python3-pip \
         build-essential \
-        ffmpeg espeak-ng \
-        libcurl4 libgomp1 libsndfile1 curl ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3 /usr/bin/python
+        ca-certificates \
+        curl \
+        espeak-ng \
+        ffmpeg \
+        libcurl4 \
+        libgomp1 \
+        libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=llama-builder /opt/llama/bin /opt/llama/bin
 ENV PATH="/opt/llama/bin:${PATH}" \
@@ -65,8 +69,8 @@ ENV PATH="/opt/llama/bin:${PATH}" \
     PYTHONUNBUFFERED=1
 
 COPY requirements.txt /tmp/requirements.txt
-RUN pip3 install --no-cache-dir --index-url https://download.pytorch.org/whl/cu124 torch==2.4.0 \
-    && pip3 install --no-cache-dir \
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install --no-cache-dir \
         --extra-index-url https://download.pytorch.org/whl/cu124 \
         -r /tmp/requirements.txt \
         supervisor
