@@ -19,6 +19,9 @@ FROM nvidia/cuda:${CUDA_VERSION}-devel-${UBUNTU} AS llama-builder
 
 # Ampere (A4000/A5000/3060=86, A100=80) + Ada (4060/4070Ti=89).
 ARG CUDA_ARCHS="80;86;89"
+# Pin llama.cpp to a known-good release — master regresses often and has
+# crash-looped at Gemma 4 model load on newer builds. b9692 = 2026-06-17.
+ARG LLAMA_CPP_REF=b9692
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -32,7 +35,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
 ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH}
 
-RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp /src/llama.cpp
+RUN git clone --depth 1 --branch "${LLAMA_CPP_REF}" \
+        https://github.com/ggml-org/llama.cpp /src/llama.cpp
 
 RUN cmake -S /src/llama.cpp -B /src/build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \

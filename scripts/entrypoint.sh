@@ -11,11 +11,10 @@ if [[ "${1:-}" == "llama" ]]; then
     # error. KV-cache quantisation (q8_0) roughly halves cache VRAM.
     PERF_ARGS="${LLM_PERF_ARGS:---flash-attn on --cache-type-k q8_0 --cache-type-v q8_0}"
 
-    # Recent llama.cpp auto-"fits" params to device memory by default and can
-    # crash-loop at load on some GPUs ("fitting params to device memory ...").
-    # We offload everything explicitly via -ngl, so disable auto-fit. Override
-    # with LLM_FIT_ARGS="" if your build lacks the flag.
-    FIT_ARGS="${LLM_FIT_ARGS:--fit off}"
+    # Extra load-time flags. Empty by default (the pinned llama.cpp build is
+    # known-good). On newer master that auto-"fits" params and crash-loops, set
+    # LLM_FIT_ARGS="-fit off".
+    FIT_ARGS="${LLM_FIT_ARGS:-}"
 
     # Locate the llama-server binary (the official base image ships it in /app).
     LLAMA_BIN="$(command -v llama-server || true)"
