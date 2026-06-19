@@ -10,14 +10,14 @@ python-multipart>=0.0.9
 
 numpy>=1.26.4,<2
 soundfile>=0.13,<1
-soxr>=0.5,<1
+soxr>=1.0,<1.1
 huggingface_hub>=0.36,<2
 
 # TTS — Kokoro 82M, requires espeak-ng at the OS level.
 kokoro==0.9.4
 
 # CPU VAD + turn detection. Pipecat bundles Silero ONNX and Smart Turn v3.2 CPU ONNX.
-onnxruntime>=1.24,<1.25
+onnxruntime>=1.24.3,<1.25
 pipecat-ai==1.4.0
 
 # STT — NVIDIA Nemotron Speech Streaming EN 0.6B via NeMo.
