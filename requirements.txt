@@ -1,9 +1,25 @@
-# torch is installed separately in the Dockerfile (CUDA wheel index).
-fastapi>=0.115,<0.120
-uvicorn[standard]>=0.30,<0.35
-httpx>=0.27,<0.29
-soundfile>=0.12
-numpy<2.0
-pydantic>=2.5,<3
+# PyTorch/TorchAudio come from the base image:
+# pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+httpx>=0.27,<1
+websockets>=13.1,<16
+pydantic>=2.10,<3
+pydantic-settings>=2.6,<3
 python-multipart>=0.0.9
-kokoro>=0.9.4
+
+numpy>=1.26.4,<2
+soundfile>=0.13,<1
+soxr>=0.5,<1
+huggingface_hub>=0.36,<2
+
+# TTS — Kokoro 82M, requires espeak-ng at the OS level.
+kokoro==0.9.4
+
+# CPU VAD + turn detection. Pipecat bundles Silero ONNX and Smart Turn v3.2 CPU ONNX.
+onnxruntime>=1.24,<1.25
+pipecat-ai==1.4.0
+
+# STT — NVIDIA Nemotron Speech Streaming EN 0.6B via NeMo.
+# 2.4.1 keeps Python >=3.10 / torch-compatible metadata for the required CUDA 12.4 base.
+nemo_toolkit[asr]==2.4.1

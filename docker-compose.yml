@@ -1,22 +1,38 @@
 services:
-  gpu-api:
-    build:
-      context: .
-      args:
-        # Match to the host's CUDA/driver if needed.
-        CUDA_VERSION: "12.4.1"
-    image: gpu-multimodal-api:latest
-    container_name: gpu-multimodal-api
+  llm:
+    image: ${LLAMA_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda}
+    container_name: speaker-llm
     restart: unless-stopped
     env_file:
       - .env
-    ports:
-      - "8000:8000"
+    environment:
+      HF_HOME: /models/hf-cache
+      HUGGINGFACE_HUB_CACHE: /models/hf-cache/hub
+    command:
+      - -hf
+      - ${LLM_HF_REPO:-google/gemma-3-12b-it-qat-q4_0-gguf}:${LLM_HF_QUANT:-Q4_0}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --alias
+      - ${LLM_MODEL_NAME:-gemma-3-12b}
+      - -ngl
+      - ${LLM_GPU_LAYERS:-99}
+      - -c
+      - ${LLM_CONTEXT:-8192}
+      - -np
+      - ${LLM_PARALLEL:-2}
+      - --jinja
+      - --flash-attn
+      - "on"
+      - --cache-type-k
+      - q8_0
+      - --cache-type-v
+      - q8_0
     volumes:
-      # Persist downloaded weights + HF cache across restarts.
-      - ./models:/models
+      - hf-cache:/models/hf-cache
     shm_size: "2gb"
-    # Large model load + first-token latency; give health checks room.
     stop_grace_period: 30s
     deploy:
       resources:
@@ -25,3 +41,39 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  api:
+    build:
+      context: .
+      args:
+        PYTORCH_IMAGE: ${PYTORCH_IMAGE:-pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime}
+    image: speaker-voice-api:cuda12.4
+    container_name: speaker-voice-api
+    restart: unless-stopped
+    depends_on:
+      - llm
+    env_file:
+      - .env
+    environment:
+      LLM_BASE_URL: http://llm:8080
+      HF_HOME: /models/hf-cache
+      HUGGINGFACE_HUB_CACHE: /models/hf-cache/hub
+      NEMO_CACHE_DIR: /models/nemo-cache
+    ports:
+      - "8000:8000"
+    volumes:
+      - hf-cache:/models/hf-cache
+      - nemo-cache:/models/nemo-cache
+    shm_size: "4gb"
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  hf-cache:
+  nemo-cache:

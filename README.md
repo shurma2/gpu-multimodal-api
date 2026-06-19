@@ -1,165 +1,137 @@
-# GPU Multimodal API — Gemma 4 12B + Qwen3-TTS in one container
+# Speaker Voice API
 
-Run two models in parallel behind a single OpenAI-compatible API:
+Docker stack for a local voice agent backend on an NVIDIA GPU host, tuned for an RTX 3090 Ti / CUDA 12.x environment.
 
-| Model | Role | Engine | Endpoints |
-|-------|------|--------|-----------|
-| `google/gemma-4-12B-it-qat-q4_0-gguf` (Q4_0) | Chat + **vision** + **audio-in** | llama.cpp `llama-server` | `/v1/chat/completions`, `/v1/completions` |
-| `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | **Streaming TTS**, fluent English | PyTorch | `/v1/audio/speech`, `/v1/audio/voices` |
+## Services
 
-One image, three processes managed by `supervisord`:
+| Compose service | Image/base | Purpose |
+| --- | --- | --- |
+| `llm` | `ghcr.io/ggml-org/llama.cpp:server-cuda` | Gemma 3 12B Q4 GGUF, OpenAI-compatible llama.cpp API |
+| `api` | `pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime` | FastAPI gateway, STT, VAD, Smart Turn, Kokoro TTS |
 
-```
-                       :8000 (public, OpenAI-compatible, API-key auth)
- client ───────────►  ┌──────────────────────────────────────────────┐
-                      │            FastAPI gateway                     │
-                      │   /v1/chat/completions   /v1/audio/speech      │
-                      │   /v1/voice/chat         /v1/models  /health   │
-                      └───────┬───────────────────────────┬───────────┘
-              127.0.0.1:8081  │                            │  127.0.0.1:8082
-                      ┌───────▼────────┐          ┌────────▼─────────┐
-                      │  llama-server  │          │  Qwen3-TTS svc   │
-                      │   (Gemma 4)    │          │   (FastAPI)      │
-                      └────────────────┘          └──────────────────┘
-                                  shared single NVIDIA GPU
-```
+Only `api` publishes a port: `8000`.
 
-## Quick start
+## Models
+
+| Role | Model | Runtime |
+| --- | --- | --- |
+| STT | `nvidia/nemotron-speech-streaming-en-0.6b` | NVIDIA NeMo, GPU |
+| VAD | Silero VAD ONNX bundled with Pipecat | CPU |
+| End of turn | Smart Turn v3.2 ONNX bundled with Pipecat | CPU |
+| LLM | `google/gemma-3-12b-it-qat-q4_0-gguf:Q4_0` | llama.cpp server, GPU |
+| TTS | Kokoro-82M, 24 kHz | GPU by default, CPU optional |
+
+HF and NeMo caches are named Docker volumes, so first boot downloads once and later restarts reuse the weights.
+
+## Requirements On The Host
+
+- NVIDIA driver with CUDA 12.x support.
+- NVIDIA Container Toolkit.
+- Docker Compose v2.
+- GPU with enough VRAM. RTX 3090 Ti 24 GB is the target.
+
+## Quick Start
 
 ```bash
+cd models_docker
 cp .env.example .env
-#  - set API_KEY
-#  - set HF_TOKEN  (Gemma is gated: accept its license on Hugging Face first)
-
 docker compose up --build -d
-docker compose logs -f          # first boot downloads ~9 GB of weights
-
-curl -s localhost:8000/health   # {"status":"ok","services":{"llm":"ok","tts":"ok"}}
+docker compose logs -f api
 ```
 
-Weights are cached in `./models`, so subsequent starts are fast.
+Health:
 
-> Requires the **NVIDIA Container Toolkit** on the host (`--gpus all`). The
-> compose file already requests all GPUs.
-
-## VRAM — will it fit?
-
-Both models share one GPU. Rough budget at defaults (8K context, Q8 KV cache):
-
-| Component | VRAM |
-|-----------|------|
-| Gemma 4 12B Q4_0 weights | ~7.0 GB |
-| KV cache (8K ctx, q8_0) + mm buffers | ~2–3 GB |
-| Qwen3-TTS 0.6B (bf16) + runtime | ~2 GB |
-| **Total** | **~11–12 GB** |
-
-| GPU | VRAM | Verdict |
-|-----|------|---------|
-| RTX A4000 | 16 GB | ✅ Comfortable — can raise `LLM_CONTEXT` / `LLM_PARALLEL` |
-| RTX 4070 Ti | 12 GB | ✅ OK — keep defaults, or `LLM_CONTEXT=4096` |
-| RTX 3060 | 12 GB | ✅ OK (slower) — `LLM_CONTEXT=4096` |
-| RTX 4060 | 8 GB | ⚠️ Both won't fit. Options below. |
-
-**For 8 GB cards** pick one:
-- `TTS_DEVICE=cpu` — keep Gemma on GPU, run TTS on CPU (slower TTS, no streaming latency win).
-- Use a smaller audio-capable Gemma 4 variant (E2B / E4B) via `LLM_HF_REPO` — check the exact GGUF repo name on Hugging Face.
-- Lower `LLM_GPU_LAYERS` to spill some layers to system RAM (slower).
-
-## API
-
-Auth: send `Authorization: Bearer $API_KEY` on every `/v1/*` request.
-
-### Chat (text)
 ```bash
-curl localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
-  -d '{"model":"gemma-4-12b","messages":[{"role":"user","content":"Hi!"}],"stream":true}'
+curl -s http://localhost:8000/health
 ```
 
-### Chat with an image
+The LLM and STT weights are downloaded lazily. `/health` can be `degraded` while llama.cpp is downloading Gemma. STT loads on the first transcription or WebSocket commit.
+
+## Main Endpoints
+
+```text
+GET  /health
+GET  /v1/models
+POST /v1/chat/completions
+POST /v1/completions
+POST /v1/audio/speech
+GET  /v1/audio/voices
+POST /v1/audio/transcriptions
+POST /v1/audio/vad
+POST /v1/audio/turn
+WS   /v1/audio/stream
+POST /v1/voice/chat
+```
+
+The WebSocket endpoint accepts binary PCM16 mono audio at 16 kHz. It emits JSON events for readiness, VAD state changes, and final transcripts.
+
+## Examples
+
+Chat:
+
 ```bash
-curl localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
-  -d '{"model":"gemma-4-12b","messages":[{"role":"user","content":[
-        {"type":"text","text":"What is in this image?"},
-        {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,<...>"}}
-      ]}]}'
+curl http://localhost:8000/v1/chat/completions \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer $API_KEY" \
+  -d '{"model":"gemma-3-12b","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
-### Chat with audio input (Gemma 4 understands speech)
+TTS:
+
 ```bash
-curl localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
-  -d '{"model":"gemma-4-12b","messages":[{"role":"user","content":[
-        {"type":"text","text":"Transcribe and answer."},
-        {"type":"input_audio","input_audio":{"data":"<base64-wav>","format":"wav"}}
-      ]}]}'
+curl http://localhost:8000/v1/audio/speech \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer $API_KEY" \
+  -d '{"model":"kokoro","input":"Hello from Kokoro.","voice":"am_michael","response_format":"wav"}' \
+  --output speech.wav
 ```
 
-### Text-to-speech (full file)
+STT:
+
 ```bash
-curl localhost:8000/v1/audio/speech \
-  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
-  -d '{"model":"qwen3-tts","input":"Hello, how are you today?","voice":"Ryan","response_format":"mp3"}' \
-  --output out.mp3
+curl http://localhost:8000/v1/audio/transcriptions \
+  -H "authorization: Bearer $API_KEY" \
+  -F model=nemotron-speech-streaming-en-0.6b \
+  -F file=@sample.wav
 ```
 
-### Streaming TTS (low latency)
+VAD:
+
 ```bash
-curl -N localhost:8000/v1/audio/speech \
-  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
-  -d '{"model":"qwen3-tts","input":"Streaming speech, chunk by chunk.","stream":true,"response_format":"mp3"}' \
-  --output stream.mp3
+curl http://localhost:8000/v1/audio/vad \
+  -H "authorization: Bearer $API_KEY" \
+  -F file=@sample.wav
 ```
-`response_format`: `mp3`, `wav`, `pcm`, `opus`, `aac`, `flac`. For lowest
-latency use `pcm` (raw 16-bit mono, sample rate in the `X-Sample-Rate` header).
 
-### Voice chat (Gemma reply → spoken)
+Smart Turn:
+
 ```bash
-curl -N localhost:8000/v1/voice/chat \
-  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"Tell me a fun fact."}],"voice":"Ryan"}' \
-  --output reply.mp3
-# the text reply is also returned URL-encoded in the X-Assistant-Text header
+curl http://localhost:8000/v1/audio/turn \
+  -H "authorization: Bearer $API_KEY" \
+  -F file=@sample.wav
 ```
 
-### Works with OpenAI SDKs
-```python
-from openai import OpenAI
-c = OpenAI(base_url="http://your-server:8000/v1", api_key="$API_KEY")
-print(c.chat.completions.create(model="gemma-4-12b",
-      messages=[{"role":"user","content":"Hello"}]).choices[0].message.content)
-c.audio.speech.create(model="qwen3-tts", voice="Ryan",
-      input="Hello there").stream_to_file("hi.mp3")
-```
+## Useful Environment Variables
 
-## Voices
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `API_KEY` | empty | If empty, auth is disabled. Set it in production. |
+| `LLM_MODEL_NAME` | `gemma-3-12b` | Model alias exposed by llama.cpp. |
+| `LLM_HF_REPO` | `google/gemma-3-12b-it-qat-q4_0-gguf` | GGUF repo for llama.cpp `-hf`. |
+| `LLM_HF_QUANT` | `Q4_0` | Gemma 3 QAT quant. |
+| `LLM_CONTEXT` | `8192` | Reduce if VRAM is tight. |
+| `LLM_PARALLEL` | `2` | llama.cpp parallel slots. |
+| `LLM_GPU_LAYERS` | `99` | Keep model layers on GPU. |
+| `STT_MODEL_ID` | `nvidia/nemotron-speech-streaming-en-0.6b` | NeMo/HF model id. |
+| `STT_DEVICE` | `cuda` | Set `cpu` only for debugging. |
+| `TTS_DEVICE` | `cuda` | Set `cpu` to leave more GPU headroom for LLM/STT. |
+| `TTS_DEFAULT_SPEAKER` | `am_michael` | Must be a Kokoro voice id. |
+| `VAD_CONFIDENCE` | `0.7` | Silero speech confidence threshold. |
+| `TURN_CPU_COUNT` | `1` | ONNX CPU threads for Smart Turn. |
 
-Always-English by default (`TTS_DEFAULT_SPEAKER=Ryan`). Fluent-English options:
-**Ryan** (dynamic male) and **Aiden** (sunny American male). Any unknown/OpenAI
-voice name falls back to the default, so a single consistent voice is guaranteed.
-List all: `GET /v1/audio/voices`. Tune delivery with `instruct`
-(e.g. `"Speak slowly and warmly"`).
+## Notes
 
-## Configuration
-
-All behaviour is env-driven — see [.env.example](.env.example). Key knobs:
-`API_KEY`, `HF_TOKEN`, `LLM_CONTEXT`, `LLM_PARALLEL`, `LLM_GPU_LAYERS`,
-`LLM_PERF_ARGS`, `TTS_DEFAULT_SPEAKER`, `TTS_DEVICE`.
-
-## Notes & caveats
-
-- **Bleeding edge.** Gemma 4 and Qwen3-TTS are recent. The image is built on the
-  official `ghcr.io/ggml-org/llama.cpp:server-cuda` (override via the `LLAMA_IMAGE`
-  build arg / pin a tag for reproducibility). If `--flash-attn` fails to parse on
-  a very new build, set
-  `LLM_PERF_ARGS="--flash-attn on --cache-type-k q8_0 --cache-type-v q8_0"`.
-- **Native TTS streaming** is used automatically if the installed `qwen-tts`
-  exposes `generate_custom_voice(stream=True)`; otherwise the service falls back
-  to full synthesis sliced into frames — the HTTP streaming contract is
-  identical either way. See [tts/engine.py](tts/engine.py).
-- **Concurrency.** TTS GPU calls are serialised with a lock (one TTS request at
-  a time); the LLM handles `LLM_PARALLEL` concurrent slots. Scale TTS by running
-  more replicas behind the gateway.
-- **GPU arch coverage** comes from the official llama.cpp image (broad
-  Turing→Ada+ support); the PyTorch TTS wheel covers the same range.
+- `llm` uses the official CUDA 12 llama.cpp server image, not a local source build.
+- `api` keeps CUDA 12.4 through the PyTorch base image.
+- `espeak-ng` is installed in the API image for Kokoro G2P.
+- `soundfile` handles WAV/FLAC/OGG uploads; ffmpeg is used as a fallback decoder for other containers.

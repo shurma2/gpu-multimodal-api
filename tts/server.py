@@ -1,4 +1,4 @@
-"""HTTP service around the Qwen3-TTS engine.
+"""HTTP service around the Kokoro-82M TTS engine.
 
 Exposes an OpenAI-compatible text-to-speech endpoint plus streaming. It binds to
 127.0.0.1 only; the public surface is the gateway. Auth is handled by the
@@ -27,7 +27,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .engine import ENGLISH_VOICES, SPEAKERS, TTSEngine
 
-TTS_MODEL_NAME = os.environ.get("TTS_MODEL_NAME", "qwen3-tts")
+TTS_MODEL_NAME = os.environ.get("TTS_MODEL_NAME", "kokoro")
 
 # response_format -> (ffmpeg output args or None for native, media type)
 _FORMATS = {
@@ -49,7 +49,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Qwen3-TTS service", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Kokoro TTS service", version="1.0.0", lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------- #
@@ -148,7 +148,7 @@ async def health():
 
 @app.get("/v1/models")
 async def models():
-    return {"object": "list", "data": [{"id": TTS_MODEL_NAME, "object": "model", "owned_by": "qwen"}]}
+    return {"object": "list", "data": [{"id": TTS_MODEL_NAME, "object": "model", "owned_by": "hexgrad"}]}
 
 
 @app.get("/v1/audio/voices")
