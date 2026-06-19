@@ -31,9 +31,20 @@ ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH}
 RUN git clone --depth 1 --branch "${LLAMA_CPP_REF}" \
         https://github.com/ggml-org/llama.cpp /src/llama.cpp
 
+# GGML_NATIVE=ON (the default) bakes -march=native from the CI runner, which has
+# AVX512. The GPU-rental CPUs are AMD Zen 3 (Ryzen 5900X/5950X) with NO AVX512,
+# so the binary hit an illegal instruction (SIGILL, exit 132) while loading the
+# model. Build a portable binary: disable native/AVX512, keep an AVX2 baseline
+# (supported by every Zen2+/Haswell+ host).
 RUN cmake -S /src/llama.cpp -B /src/build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DGGML_CUDA=ON \
+        -DGGML_NATIVE=OFF \
+        -DGGML_AVX=ON \
+        -DGGML_AVX2=ON \
+        -DGGML_FMA=ON \
+        -DGGML_F16C=ON \
+        -DGGML_AVX512=OFF \
         -DLLAMA_CURL=ON \
         -DLLAMA_OPENSSL=ON \
         -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
