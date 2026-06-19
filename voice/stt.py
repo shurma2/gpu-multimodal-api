@@ -256,12 +256,16 @@ class STTStreamSession:
             sub = int(getattr(enc, "subsampling_factor", 8) or 8)
             window_stride = float(getattr(model.cfg.preprocessor, "window_stride", 0.01))
             hop = max(1, int(self._sr * window_stride))
+            # streaming_cfg.chunk_size is in input feature frames (hop-sized),
+            # NOT post-subsampling encoder frames, so audio samples per step is
+            # chunk_frames * hop (do not multiply by the subsampling factor).
             if chunk_frames:
-                self.step_samples = max(hop, int(chunk_frames) * sub * hop)
+                self.step_samples = max(hop, int(chunk_frames) * hop)
             else:
                 self.step_samples = self._sr  # ~1s fallback
             self.introspection.update(
-                {"chunk_frames": chunk_frames, "subsampling": sub, "hop": hop}
+                {"chunk_frames": chunk_frames, "subsampling": sub, "hop": hop,
+                 "step_seconds": round(self.step_samples / self._sr, 3)}
             )
 
             self._cache_lc, self._cache_lt, self._cache_lc_len = enc.get_initial_cache_state(
