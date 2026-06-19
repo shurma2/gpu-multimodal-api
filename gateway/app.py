@@ -357,6 +357,24 @@ async def audio_turn(
         raise HTTPException(400, str(exc)) from exc
 
 
+@app.post("/debug/stt-stream")
+async def debug_stt_stream(
+    authorization: Optional[str] = Header(None),
+    file: UploadFile = File(...),
+    ws_chunk_ms: int = Form(default=100),
+):
+    """Validate the cache-aware streaming STT path over an uploaded clip and
+    compare with batch. Returns introspection, per-step timings, streamed vs
+    batch text, and any traceback — so the streaming rework can be verified
+    remotely without SSH."""
+    _auth(authorization)
+    data = await file.read()
+    try:
+        return await get_stt().stream_probe(data, ws_chunk_ms=ws_chunk_ms)
+    except AudioDecodeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.websocket("/v1/audio/stream")
 async def audio_stream(websocket: WebSocket):
     """Unified VAD + end-of-turn + STT channel.
@@ -382,25 +400,34 @@ async def audio_stream(websocket: WebSocket):
     await websocket.accept()
 
     service = get_vad_turn()
+    stt = get_stt()
     sample_rate = settings.vad_sample_rate
     vad = service.create_vad(sample_rate)
     turn = service.create_turn_analyzer(sample_rate)
     speech_buffer = bytearray()
     speaking = False
+    # Per-turn streaming decoder: transcribes concurrently with the speech so
+    # the final text is ready the instant the turn ends. Falls back to batch
+    # transcription of speech_buffer if the streaming path is unavailable.
+    stt_session = await stt.create_stream_session()
 
     async def emit_end_of_turn(reason: str, metrics=None) -> None:
-        """Transcribe the buffered utterance and emit the single end-of-turn
-        event, then reset for the next turn."""
-        nonlocal speaking
+        """Emit the single end-of-turn event with the final transcript, then
+        reset for the next turn. Uses the already-streamed transcript (no extra
+        latency); falls back to a one-shot batch decode if streaming is off."""
+        nonlocal speaking, stt_session
         text = ""
-        if speech_buffer:
+        if stt_session.ok:
+            text = await stt_session.finalize()
+        elif speech_buffer:
             audio = pcm16_bytes_to_float(bytes(speech_buffer))
-            text = await get_stt().transcribe_audio(audio, sample_rate)
+            text = await stt.transcribe_audio(audio, sample_rate)
         payload = {
             "type": "end_of_turn",
             "text": text,
             "complete": True,
             "reason": reason,
+            "streamed": stt_session.ok,
             "probability": getattr(metrics, "probability", None) if metrics else None,
             "processing_ms": getattr(metrics, "e2e_processing_time_ms", None) if metrics else None,
         }
@@ -408,6 +435,7 @@ async def audio_stream(websocket: WebSocket):
         speech_buffer.clear()
         turn.clear()
         speaking = False
+        stt_session = await stt.create_stream_session()
 
     await websocket.send_json(
         {
@@ -438,6 +466,7 @@ async def audio_stream(websocket: WebSocket):
 
                 if is_speech or turn.speech_triggered:
                     speech_buffer.extend(chunk)
+                    await stt_session.feed(pcm16_bytes_to_float(chunk))
 
                 turn_state = turn.append_audio(chunk, is_speech)
                 metrics = None
@@ -469,6 +498,7 @@ async def audio_stream(websocket: WebSocket):
                 speech_buffer.clear()
                 turn.clear()
                 speaking = False
+                stt_session = await stt.create_stream_session()
                 await websocket.send_json({"type": "reset"})
             elif action in ("commit", "flush"):
                 await emit_end_of_turn("commit")
