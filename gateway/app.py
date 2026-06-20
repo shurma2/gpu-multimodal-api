@@ -418,13 +418,21 @@ async def audio_stream(websocket: WebSocket):
 
     async def fire_thought_end(reason: str, allow_empty: bool = True) -> None:
         nonlocal speaking, stt_session, last_partial
-        # flush the tail of the recognizer so any open segment is finalized
-        result = await stt_session.finalize()
-        controller.ingest_stream(result)
-        for seg in result["finals"]:
-            if seg:
-                await websocket.send_json({"type": "final_text", "text": seg})
-        payload = controller.take_thought_end(reason)
+        # Authoritative final text via the reliable batch decoder over the whole
+        # utterance — streaming partials/finals were live best-effort (a short
+        # final word can slip through cache-aware streaming). ~60 ms, no delay.
+        audio = stt_session.utterance_audio()
+        if audio.size:
+            final = await stt.final_transcript(audio, sample_rate)
+        else:
+            final = {"text": "", "segments": []}
+        controller.reset()
+        payload = {
+            "type": "thought_end",
+            "text": final["text"],
+            "segments": final["segments"],
+            "reason": reason,
+        }
         # a commit on an already-finished turn carries nothing — don't emit it
         if allow_empty or payload["segments"] or payload["text"]:
             await websocket.send_json(payload)

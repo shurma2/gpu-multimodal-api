@@ -19,6 +19,29 @@ import time
 from voice.audio import decode_audio_bytes, to_mono_f32
 
 
+def split_endpoint_segments(
+    text: str, eou_tokens: tuple[str, ...], eob_token: str
+) -> list[dict[str, Any]]:
+    """Split a transcript on inline endpoint markers into ordered segments,
+    each {"text": <stripped>, "kind": "eou"|"eob"|"open"}. The trailing "open"
+    segment (if any) is the live partial. Shared by the streaming session and the
+    batch-authoritative thought_end so both parse tokens identically."""
+    markers = [m for m in (*eou_tokens, eob_token) if m]
+    if not markers:
+        return [{"text": text.strip(), "kind": "open"}]
+    pattern = re.compile("|".join(re.escape(m) for m in markers))
+    segments: list[dict[str, Any]] = []
+    pos = 0
+    for m in pattern.finditer(text):
+        seg = text[pos : m.start()].strip()
+        kind = "eob" if m.group(0) == eob_token else "eou"
+        if seg or kind == "eou":
+            segments.append({"text": seg, "kind": kind})
+        pos = m.end()
+    segments.append({"text": text[pos:].strip(), "kind": "open"})
+    return segments
+
+
 class STTEngine:
     """Lazy, serialized ASR engine.
 
@@ -247,6 +270,19 @@ class STTEngine:
                 sample_rate,
             )
 
+    async def final_transcript(self, audio: np.ndarray, sample_rate: int) -> dict[str, Any]:
+        """Authoritative end-of-turn transcript via the reliable batch decoder,
+        parsed into endpoint segments. Used for thought_end so the final text is
+        always full-quality (streaming partials/finals remain best-effort live)."""
+        raw = await self.transcribe_audio(audio, sample_rate)
+        segs = split_endpoint_segments(
+            raw,
+            tuple(getattr(self.settings, "stt_eou_tokens", ("<EOU>", "</s>"))),
+            str(getattr(self.settings, "stt_eob_token", "<EOB>")),
+        )
+        segments = [s["text"] for s in segs if s["kind"] != "eob" and s["text"]]
+        return {"text": " ".join(segments).strip(), "segments": segments, "raw": raw}
+
     def _transcribe_audio_sync(self, audio: np.ndarray, sample_rate: int) -> str:
         import torch
 
@@ -377,29 +413,7 @@ class STTStreamSession:
             self.ok = False
 
     def _parse(self, raw: str) -> list[dict[str, Any]]:
-        """Split the cumulative hypothesis into segments delimited by inline
-        endpoint tokens. Returns ordered segments, each:
-            {"text": <stripped>, "kind": "eou" | "eob" | "open"}
-        The trailing "open" segment (if any) is the live partial. Empty closed
-        segments are dropped."""
-        markers = list(self._eou_tokens)
-        if self._eob_token:
-            markers.append(self._eob_token)
-        if not markers:
-            return [{"text": raw.strip(), "kind": "open"}]
-        pattern = re.compile("|".join(re.escape(m) for m in markers))
-        eob = self._eob_token
-        segments: list[dict[str, Any]] = []
-        pos = 0
-        for m in pattern.finditer(raw):
-            text = raw[pos : m.start()].strip()
-            kind = "eob" if m.group(0) == eob else "eou"
-            if text or kind == "eou":
-                segments.append({"text": text, "kind": kind})
-            pos = m.end()
-        tail = raw[pos:].strip()
-        segments.append({"text": tail, "kind": "open"})
-        return segments
+        return split_endpoint_segments(raw, self._eou_tokens, self._eob_token)
 
     @staticmethod
     def _as_scalar(v: Any) -> int:
@@ -600,3 +614,7 @@ class STTStreamSession:
         """Last `seconds` of the turn audio — for an on-demand Smart Turn check."""
         n = int(seconds * self._sr)
         return self._raw[-n:] if n and self._raw.shape[0] > n else self._raw
+
+    def utterance_audio(self) -> np.ndarray:
+        """All audio accumulated this turn (for the authoritative batch decode)."""
+        return self._raw
