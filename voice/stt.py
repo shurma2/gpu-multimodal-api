@@ -178,49 +178,43 @@ class STTEngine:
         session = STTStreamSession(self)
         out["introspection"] = session.introspection
         out["ok"] = session.ok
-        out["step_samples"] = session.step_samples
         if not session.ok:
             out["error"] = session.error
         else:
             ws = max(1, int(sr * ws_chunk_ms / 1000))
-            pending = np.zeros(0, dtype=np.float32)
             steps: list[dict[str, Any]] = []
             finals: list[str] = []
+            partials: list[str] = []
             t_stream = time.time()
-            try:
-                for i in range(0, len(audio), ws):
-                    pending = np.concatenate([pending, audio[i : i + ws]])
-                    while pending.shape[0] >= session.step_samples:
-                        block = pending[: session.step_samples]
-                        pending = pending[session.step_samples :]
-                        t0 = time.time()
-                        res = session.step_sync(block, is_last=False)
-                        finals.extend(res["finals"])
-                        steps.append({"samples": int(block.shape[0]),
-                                      "ms": round((time.time() - t0) * 1000, 1),
-                                      "partial": res["partial"], "finals": res["finals"],
-                                      "eou": res["eou"], "eob": res["eob"]})
-                    if len(steps) >= 200:
-                        break
+            for i in range(0, len(audio), ws):
                 t0 = time.time()
-                res = session.step_sync(
-                    pending if pending.shape[0] else np.zeros(1, dtype=np.float32),
-                    is_last=True,
-                )
+                res = session.feed_sync(audio[i : i + ws])
+                if not session.ok:
+                    out["error"] = session.error
+                    out["traceback"] = session.introspection.get("step_traceback")
+                    break
                 finals.extend(res["finals"])
-                steps.append({"samples": int(pending.shape[0]), "final": True,
-                              "ms": round((time.time() - t0) * 1000, 1),
-                              "partial": res["partial"], "finals": res["finals"],
-                              "eou": res["eou"], "eob": res["eob"]})
-                out["stream_ms"] = round((time.time() - t_stream) * 1000, 1)
-                out["raw_text"] = res["raw"]  # cumulative hypothesis incl. tokens
-                out["final_segments"] = finals
-                out["streamed_text"] = " ".join(finals).strip()
-                out["steps"] = steps
-            except Exception as exc:  # noqa: BLE001
-                out["ok"] = False
-                out["error"] = f"step: {type(exc).__name__}: {exc}"
-                out["traceback"] = traceback.format_exc()
+                if res["partial"]:
+                    partials.append(res["partial"])
+                if res["finals"] or res["eou"] or res["eob"]:
+                    steps.append({"ms": round((time.time() - t0) * 1000, 1),
+                                  "partial": res["partial"], "finals": res["finals"],
+                                  "eou": res["eou"], "eob": res["eob"]})
+            if session.ok:
+                t0 = time.time()
+                res = session.finalize_sync()
+                finals.extend(res["finals"])
+                out["final_ms"] = round((time.time() - t0) * 1000, 1)
+                if not session.ok:
+                    out["error"] = session.error
+                    out["traceback"] = session.introspection.get("final_traceback")
+            out["stream_ms"] = round((time.time() - t_stream) * 1000, 1)
+            out["raw_text"] = session._text  # cumulative hypothesis incl. tokens
+            out["final_segments"] = finals
+            out["streamed_text"] = " ".join(finals).strip()
+            out["n_partials"] = len(partials)
+            out["last_partials"] = partials[-5:]
+            out["marker_steps"] = steps
 
         t0 = time.time()
         try:
@@ -336,30 +330,33 @@ class STTStreamSession:
                 return
 
             enc.setup_streaming_params()
-            # deterministic per-chunk features (no dithering / extra padding)
+            # deterministic features (no dithering / extra padding) so re-running
+            # the preprocessor over the growing buffer is stable frame-for-frame.
             try:
                 model.preprocessor.featurizer.dither = 0.0
                 model.preprocessor.featurizer.pad_to = 0
             except Exception:  # noqa: BLE001
                 pass
 
+            # Cache-aware streaming chunking, all in INPUT feature frames:
+            #   * chunk_size / shift_size may be [first, subsequent] lists
+            #   * each step feeds `pre_encode_cache_size` history frames + chunk
+            #   * drop_extra_pre_encoded is 0 on step 0, else the configured value
             cfg = getattr(enc, "streaming_cfg", None)
-            chunk_frames = getattr(cfg, "chunk_size", None) if cfg is not None else None
-            if isinstance(chunk_frames, (list, tuple)):
-                chunk_frames = chunk_frames[-1]
+            self._chunk_size = getattr(cfg, "chunk_size", 16) if cfg is not None else 16
+            self._shift_size = getattr(cfg, "shift_size", self._chunk_size) if cfg is not None else self._chunk_size
+            self._pre_encode = self._as_scalar(getattr(cfg, "pre_encode_cache_size", 0))
+            self._drop = self._as_scalar(getattr(cfg, "drop_extra_pre_encoded", 0))
             sub = int(getattr(enc, "subsampling_factor", 8) or 8)
             window_stride = float(getattr(model.cfg.preprocessor, "window_stride", 0.01))
-            hop = max(1, int(self._sr * window_stride))
-            # streaming_cfg.chunk_size is in input feature frames (hop-sized),
-            # NOT post-subsampling encoder frames, so audio samples per step is
-            # chunk_frames * hop (do not multiply by the subsampling factor).
-            if chunk_frames:
-                self.step_samples = max(hop, int(chunk_frames) * hop)
-            else:
-                self.step_samples = self._sr  # ~1s fallback
+            self._hop = max(1, int(self._sr * window_stride))
+            # accumulate raw audio until at least one fresh chunk is decodable
+            self._min_append = self._pick(self._chunk_size, False) * self._hop
             self.introspection.update(
-                {"chunk_frames": chunk_frames, "subsampling": sub, "hop": hop,
-                 "step_seconds": round(self.step_samples / self._sr, 3)}
+                {"chunk_size": self._chunk_size, "shift_size": self._shift_size,
+                 "pre_encode_cache_size": self._pre_encode, "drop_extra_pre_encoded": self._drop,
+                 "subsampling": sub, "hop": self._hop,
+                 "last_channel_cache_size": getattr(cfg, "last_channel_cache_size", None)}
             )
 
             self._cache_lc, self._cache_lt, self._cache_lc_len = enc.get_initial_cache_state(
@@ -367,6 +364,10 @@ class STTStreamSession:
             )
             self._prev_hyp = None
             self._pred_out = None
+            self._raw = np.zeros(0, dtype=np.float32)  # full turn audio (seam-free re-mel)
+            self._feat = None  # [1, feat_dim, T] features of self._raw
+            self._buf_idx = 0  # feature frames already consumed by the encoder
+            self._step = 0
             self.ok = True
         except Exception as exc:  # noqa: BLE001
             import traceback
@@ -400,18 +401,50 @@ class STTStreamSession:
         segments.append({"text": tail, "kind": "open"})
         return segments
 
-    def step_sync(self, samples: np.ndarray, is_last: bool) -> dict[str, Any]:
-        """Run one encoder step and return a structured streaming result:
-            {"partial": str, "finals": list[str], "eou": bool, "eob": bool, "raw": str}
-        `finals` are newly-closed <EOU> segments since the previous step;
-        backchannel <EOB> segments are reported only via the `eob` flag."""
+    @staticmethod
+    def _as_scalar(v: Any) -> int:
+        if isinstance(v, (list, tuple)):
+            return int(v[-1]) if v else 0
+        return int(v or 0)
+
+    @staticmethod
+    def _pick(v: Any, first: bool) -> int:
+        """chunk_size/shift_size may be [first_chunk, subsequent_chunk]."""
+        if isinstance(v, (list, tuple)):
+            return int(v[0] if first else v[-1])
+        return int(v)
+
+    def _preprocess_all(self) -> None:
+        """(Re)compute mel features over the whole turn buffer. Cheap, and
+        seam-free (unlike per-chunk preprocessing), so the streamed transcript
+        matches batch quality."""
         import torch
 
-        model = self._model
-        sig = torch.tensor(samples, dtype=torch.float32, device=self._device).unsqueeze(0)
-        sig_len = torch.tensor([samples.shape[0]], dtype=torch.int64, device=self._device)
+        sig = torch.tensor(self._raw, dtype=torch.float32, device=self._device).unsqueeze(0)
+        sig_len = torch.tensor([self._raw.shape[0]], dtype=torch.int64, device=self._device)
         with torch.inference_mode():
-            processed, processed_len = model.preprocessor(input_signal=sig, length=sig_len)
+            self._feat, _ = self._model.preprocessor(input_signal=sig, length=sig_len)
+
+    def _make_chunk(self, start: int, end: int, first: bool):
+        """Slice feature frames [start:end] and prepend pre_encode_cache history
+        (zero-padded if not enough), so the pre-encode conv has left context."""
+        import torch
+        import torch.nn.functional as F
+
+        pre = 0 if first else self._pre_encode
+        cache_start = max(0, start - pre)
+        cache = self._feat[:, :, cache_start:start]
+        if pre and cache.size(-1) < pre:
+            cache = F.pad(cache, (pre - cache.size(-1), 0))
+        new = self._feat[:, :, start:end]
+        return torch.cat([cache, new], dim=-1) if pre else new
+
+    def _run_chunk(self, chunk, drop: int, is_last: bool) -> dict[str, Any]:
+        """One cache-aware encoder+decoder step over a prepared feature chunk."""
+        import torch
+
+        length = torch.tensor([chunk.size(-1)], dtype=torch.int64, device=self._device)
+        with torch.inference_mode():
             (
                 self._pred_out,
                 transcribed,
@@ -419,16 +452,16 @@ class STTStreamSession:
                 self._cache_lt,
                 self._cache_lc_len,
                 self._prev_hyp,
-            ) = model.conformer_stream_step(
-                processed_signal=processed,
-                processed_signal_length=processed_len,
+            ) = self._model.conformer_stream_step(
+                processed_signal=chunk,
+                processed_signal_length=length,
                 cache_last_channel=self._cache_lc,
                 cache_last_time=self._cache_lt,
                 cache_last_channel_len=self._cache_lc_len,
                 keep_all_outputs=is_last,
                 previous_hypotheses=self._prev_hyp,
                 previous_pred_out=self._pred_out,
-                drop_extra_pre_encoded=None,
+                drop_extra_pre_encoded=drop,
                 return_transcription=True,
             )
         item = transcribed[0] if isinstance(transcribed, (list, tuple)) else transcribed
@@ -469,48 +502,81 @@ class STTStreamSession:
         acc["raw"] = step["raw"]
         return acc
 
-    async def feed(self, audio: np.ndarray) -> dict[str, Any]:
-        """Buffer incoming audio and decode whole blocks as they complete.
-        Returns the aggregated streaming result across any blocks run this call."""
+    def feed_sync(self, audio: np.ndarray) -> dict[str, Any]:
+        """Accumulate audio, re-mel the turn, and decode every full chunk that
+        is now available (cache-aware). Runs inside the engine executor+lock."""
         acc = self._empty_result()
-        acc["partial"] = self._parse(self._text)[-1]["text"] if self.ok else ""
         if not self.ok:
             return acc
-        self._pending = np.concatenate([self._pending, to_mono_f32(audio)])
-        if self._pending.shape[0] < self.step_samples:
+        self._raw = np.concatenate([self._raw, to_mono_f32(audio)])
+        # need at least one fresh chunk's worth of new audio before re-mel
+        avail = self._raw.shape[0] - self._buf_idx * self._hop
+        if avail < self._min_append:
+            acc["partial"] = self._parse(self._text)[-1]["text"]
             return acc
-        loop = asyncio.get_running_loop()
-        async with self._engine._lock:
-            while self._pending.shape[0] >= self.step_samples:
-                block = self._pending[: self.step_samples]
-                self._pending = self._pending[self.step_samples :]
-                try:
-                    step = await loop.run_in_executor(
-                        self._engine._executor, self.step_sync, block, False
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    self.error = f"step: {type(exc).__name__}: {exc}"
-                    self.ok = False
-                    return acc
+        try:
+            self._preprocess_all()
+            total = self._feat.size(-1)
+            while True:
+                first = self._step == 0
+                cs = self._pick(self._chunk_size, first)
+                if self._buf_idx + cs > total:
+                    break
+                chunk = self._make_chunk(self._buf_idx, self._buf_idx + cs, first)
+                step = self._run_chunk(chunk, 0 if first else self._drop, is_last=False)
                 self._merge(acc, step)
+                self._buf_idx += cs
+                self._step += 1
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+            self.error = f"step: {type(exc).__name__}: {exc}"
+            self.introspection["step_traceback"] = traceback.format_exc()
+            self.ok = False
+        if not acc["raw"]:
+            acc["partial"] = self._parse(self._text)[-1]["text"]
         return acc
 
-    async def finalize(self) -> dict[str, Any]:
-        """Flush the tail and return the final streaming result (no full re-decode)."""
+    def finalize_sync(self) -> dict[str, Any]:
+        """Decode any remaining tail frames as the final (keep_all_outputs) step."""
+        acc = self._empty_result()
         if not self.ok:
-            return self._empty_result()
+            acc["partial"] = self._parse(self._text)[-1]["text"]
+            return acc
+        try:
+            if self._raw.shape[0] > 0:
+                self._preprocess_all()
+                total = self._feat.size(-1)
+                if self._buf_idx < total:
+                    first = self._step == 0
+                    chunk = self._make_chunk(self._buf_idx, total, first)
+                    step = self._run_chunk(chunk, 0 if first else self._drop, is_last=True)
+                    self._merge(acc, step)
+                    self._buf_idx = total
+                    self._step += 1
+                else:
+                    self._merge(acc, self._collect(is_last=True))
+            else:
+                self._merge(acc, self._collect(is_last=True))
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+            self.error = f"final: {type(exc).__name__}: {exc}"
+            self.introspection["final_traceback"] = traceback.format_exc()
+            self.ok = False
+        return acc
+
+    async def feed(self, audio: np.ndarray) -> dict[str, Any]:
+        if not self.ok:
+            r = self._empty_result()
+            r["partial"] = self._parse(self._text)[-1]["text"]
+            return r
         loop = asyncio.get_running_loop()
-        block = self._pending if self._pending.shape[0] else np.zeros(1, dtype=np.float32)
-        self._pending = np.zeros(0, dtype=np.float32)
         async with self._engine._lock:
-            try:
-                return await loop.run_in_executor(
-                    self._engine._executor, self.step_sync, block, True
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.error = f"final: {type(exc).__name__}: {exc}"
-                self.ok = False
-        return self._empty_result()
+            return await loop.run_in_executor(self._engine._executor, self.feed_sync, audio)
+
+    async def finalize(self) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        async with self._engine._lock:
+            return await loop.run_in_executor(self._engine._executor, self.finalize_sync)
 
     @property
     def text(self) -> str:
