@@ -517,10 +517,15 @@ class STTStreamSession:
         try:
             self._preprocess_all()
             total = self._feat.size(-1)
+            # Each non-last chunk drops its trailing (lookahead) outputs, which
+            # the *next* chunk re-decodes. Keep one chunk in reserve so the most
+            # recent frames are never the "last" non-last chunk — finalize runs
+            # them with keep_all_outputs=True, so a short final word isn't lost.
+            reserve = self._pick(self._chunk_size, False)
             while True:
                 first = self._step == 0
                 cs = self._pick(self._chunk_size, first)
-                if self._buf_idx + cs > total:
+                if self._buf_idx + cs + reserve > total:
                     break
                 chunk = self._make_chunk(self._buf_idx, self._buf_idx + cs, first)
                 step = self._run_chunk(chunk, 0 if first else self._drop, is_last=False)
