@@ -27,10 +27,15 @@ class Settings(BaseSettings):
     tts_default_language: str = "English"
     tts_device: str = "cuda"
 
-    stt_model_name: str = "nemotron-speech-streaming-en-0.6b"
-    stt_model_id: str = "nvidia/nemotron-speech-streaming-en-0.6b"
+    stt_model_name: str = "parakeet-realtime-eou-120m"
+    stt_model_id: str = "nvidia/parakeet_realtime_eou_120m-v1"
     stt_device: str = "cuda"
     stt_sample_rate: int = 16000
+    # Parakeet EOU emits these inline markers in the decoded text; they are
+    # stripped from partial/final text and surfaced as endpoint signals.
+    # `</s>` behaves like an end-of-utterance marker on this vocab.
+    stt_eou_tokens: tuple[str, ...] = ("<EOU>", "</s>")
+    stt_eob_token: str = "<EOB>"
 
     vad_model_name: str = "silero-vad-onnx"
     vad_sample_rate: int = 16000
@@ -39,11 +44,17 @@ class Settings(BaseSettings):
     vad_stop_secs: float = 0.2
     vad_min_volume: float = 0.6
 
-    turn_model_name: str = "smart-turn-v3"
+    turn_model_name: str = "smart-turn-v3.2"
     turn_cpu_count: int = Field(default=1, ge=1)
     turn_stop_secs: float = 3.0
     turn_pre_speech_ms: float = 500.0
     turn_max_duration_secs: float = 8.0
+
+    # Pause-tolerant endpoint controller: a Parakeet <EOU> is a *candidate* for
+    # end-of-thought; we only fire `thought_end` once Smart Turn confirms it (or
+    # the max-wait ceiling elapses so a stubborn "incomplete" can never hang).
+    endpoint_require_smart_turn: bool = True
+    endpoint_max_wait_secs: float = 4.0
 
 
 @lru_cache

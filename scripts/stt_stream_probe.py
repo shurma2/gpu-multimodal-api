@@ -28,7 +28,7 @@ import soundfile as sf
 import torch
 
 
-MODEL_ID = "nvidia/nemotron-speech-streaming-en-0.6b"
+MODEL_ID = "nvidia/parakeet_realtime_eou_120m-v1"
 TARGET_SR = 16000
 # Simulated websocket chunk: 16 kHz * 0.1 s = 1600 samples. The session will
 # accumulate these and flush whenever it has enough for one encoder step.

@@ -121,11 +121,11 @@ ENV HF_HOME=/models/hf-cache \
     TTS_MODEL_NAME=kokoro \
     TTS_DEFAULT_SPEAKER=am_michael \
     TTS_DEFAULT_LANGUAGE=English \
-    STT_MODEL_NAME=nemotron-speech-streaming-en-0.6b \
-    STT_MODEL_ID=nvidia/nemotron-speech-streaming-en-0.6b \
+    STT_MODEL_NAME=parakeet-realtime-eou-120m \
+    STT_MODEL_ID=nvidia/parakeet_realtime_eou_120m-v1 \
     STT_DEVICE=cuda \
     VAD_MODEL_NAME=silero-vad-onnx \
-    TURN_MODEL_NAME=smart-turn-v3
+    TURN_MODEL_NAME=smart-turn-v3.2
 
 EXPOSE 8000
 VOLUME ["/models"]

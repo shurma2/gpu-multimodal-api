@@ -6,17 +6,17 @@ Public surface:
     POST /v1/chat/completions       -> llama.cpp OpenAI-compatible proxy
     POST /v1/completions            -> llama.cpp OpenAI-compatible proxy
     POST /v1/audio/speech           -> Kokoro TTS
-    POST /v1/audio/transcriptions   -> Nemotron Speech STT
+    POST /v1/audio/transcriptions   -> Parakeet-EOU STT
     POST /v1/audio/vad              -> Silero VAD ONNX
-    POST /v1/audio/turn             -> Pipecat Smart Turn v3
-    WS   /v1/audio/stream           -> unified VAD + end-of-turn + STT channel
+    POST /v1/audio/turn             -> Pipecat Smart Turn v3.2
+    WS   /v1/audio/stream           -> streaming ASR + pause-tolerant end-of-thought
     POST /v1/voice/chat             -> LLM reply synthesized to speech
 
-The WebSocket channel binds VAD, end-of-turn detection and STT into a single
-event stream. The client streams raw PCM16 mono 16 kHz audio (binary frames)
-and receives JSON events. The important one is `end_of_turn`: it carries the
-final transcript and tells the consumer the speaker has finished, so it can
-stop listening and hand the text to the LLM. See README.md for the protocol.
+The WebSocket channel fuses streaming ASR (Parakeet-EOU), Silero VAD pauses and
+Smart Turn into one event stream. The client streams raw PCM16 mono 16 kHz audio
+(binary frames) and receives JSON events: live `partial_text`, per-utterance
+`final_text`, acoustic `speech_pause`, and finally `thought_end` once the user is
+confirmed done — the signal to stop listening and act. See README.md.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from gateway.config import get_settings
 from tts.codec import FORMATS, encode_full, stream_ffmpeg, stream_native
 from tts.engine import ENGLISH_VOICES, SPEAKERS, TTSEngine
 from voice.audio import AudioDecodeError, pcm16_bytes_to_float
+from voice.endpoint import EndpointController
 from voice.stt import STTEngine
 from voice.turn import VADTurnService
 
@@ -377,23 +378,27 @@ async def debug_stt_stream(
 
 @app.websocket("/v1/audio/stream")
 async def audio_stream(websocket: WebSocket):
-    """Unified VAD + end-of-turn + STT channel.
+    """Unified streaming ASR + pause-tolerant end-of-thought channel.
+
+    Three signals are fused (see voice/endpoint.py): Parakeet-EOU streams text
+    and emits `<EOU>`/`<EOB>` markers, Silero VAD provides acoustic pauses, and
+    Smart Turn semantically confirms an EOU before we declare the thought done.
 
     Client -> server:
         - binary frames: raw PCM16 mono little-endian at `sample_rate` (16 kHz)
-        - text frames (JSON): {"type": "commit"} force end-of-turn now,
-                              {"type": "reset"}  drop the buffered utterance,
+        - text frames (JSON): {"type": "commit"} force thought_end now,
+                              {"type": "reset"}  drop the in-progress thought,
                               {"type": "ping"}   liveness/readiness check
 
     Server -> client (all JSON, single channel):
-        - {"type": "ready", ...}        handshake with models + audio format
-        - {"type": "speech_started"}    VAD detected the user started talking
-        - {"type": "speech_stopped"}    VAD detected the user went quiet
-        - {"type": "end_of_turn", "text": ..., "complete": true, ...}
-              the turn finished: final transcript is attached and the consumer
-              should stop listening and act on `text`
-        - {"type": "pong", "stt": ...}  reply to ping with the STT load state
-        - {"type": "error", "error": ...}
+        - {"type": "ready", ...}              handshake with models + audio format
+        - {"type": "partial_text", "text": ..}  live hypothesis (tokens stripped)
+        - {"type": "speech_pause"}            Silero went quiet after speech (acoustic)
+        - {"type": "final_text", "text": ..}   one completed <EOU> segment
+              (several may precede a single thought_end; accumulate them)
+        - {"type": "thought_end", "text": .., "segments": [...], "reason": ..}
+              the user finished; consumer should act on the accumulated text
+        - {"type": "pong", "stt": ...} / {"type": "reset"} / {"type": "error", ...}
     """
     if not await _auth_ws(websocket):
         return
@@ -404,37 +409,25 @@ async def audio_stream(websocket: WebSocket):
     sample_rate = settings.vad_sample_rate
     vad = service.create_vad(sample_rate)
     turn = service.create_turn_analyzer(sample_rate)
-    speech_buffer = bytearray()
     speaking = False
-    # Per-turn streaming decoder: transcribes concurrently with the speech so
-    # the final text is ready the instant the turn ends. Falls back to batch
-    # transcription of speech_buffer if the streaming path is unavailable.
+    last_partial = ""
+    # Per-connection streaming decoder + endpoint controller. The recognizer
+    # runs continuously (it self-endpoints, so it must see the trailing pause).
     stt_session = await stt.create_stream_session()
+    controller = EndpointController(settings)
 
-    async def emit_end_of_turn(reason: str, metrics=None) -> None:
-        """Emit the single end-of-turn event with the final transcript, then
-        reset for the next turn. Uses the already-streamed transcript (no extra
-        latency); falls back to a one-shot batch decode if streaming is off."""
-        nonlocal speaking, stt_session
-        text = ""
-        if stt_session.ok:
-            text = await stt_session.finalize()
-        elif speech_buffer:
-            audio = pcm16_bytes_to_float(bytes(speech_buffer))
-            text = await stt.transcribe_audio(audio, sample_rate)
-        payload = {
-            "type": "end_of_turn",
-            "text": text,
-            "complete": True,
-            "reason": reason,
-            "streamed": stt_session.ok,
-            "probability": getattr(metrics, "probability", None) if metrics else None,
-            "processing_ms": getattr(metrics, "e2e_processing_time_ms", None) if metrics else None,
-        }
-        await websocket.send_json(payload)
-        speech_buffer.clear()
+    async def fire_thought_end(reason: str) -> None:
+        nonlocal speaking, stt_session, last_partial
+        # flush the tail of the recognizer so any open segment is finalized
+        result = await stt_session.finalize()
+        controller.ingest_stream(result)
+        for seg in result["finals"]:
+            if seg:
+                await websocket.send_json({"type": "final_text", "text": seg})
+        await websocket.send_json(controller.take_thought_end(reason))
         turn.clear()
         speaking = False
+        last_partial = ""
         stt_session = await stt.create_stream_session()
 
     await websocket.send_json(
@@ -464,24 +457,32 @@ async def audio_stream(websocket: WebSocket):
                 vad_name = vad_state.name.lower()
                 is_speech = vad_name in ("starting", "speaking", "stopping")
 
-                if is_speech or turn.speech_triggered:
-                    speech_buffer.extend(chunk)
-                    await stt_session.feed(pcm16_bytes_to_float(chunk))
+                # Recognizer runs on every frame; EOU detection needs the pause.
+                result = await stt_session.feed(pcm16_bytes_to_float(chunk))
+                controller.ingest_stream(result)
+                if result["partial"] and result["partial"] != last_partial:
+                    last_partial = result["partial"]
+                    await websocket.send_json(
+                        {"type": "partial_text", "text": result["partial"]}
+                    )
+                for seg in result["finals"]:
+                    if seg:
+                        await websocket.send_json({"type": "final_text", "text": seg})
 
-                turn_state = turn.append_audio(chunk, is_speech)
-                metrics = None
-                if turn.speech_triggered and vad_name == "quiet":
-                    turn_state, metrics = await turn.analyze_end_of_turn()
-
-                if is_speech and not speaking:
+                turn.append_audio(chunk, is_speech)
+                if is_speech:
                     speaking = True
-                    await websocket.send_json({"type": "speech_started"})
-                elif not is_speech and speaking and vad_name == "quiet":
+                elif speaking and vad_name == "quiet":
+                    # acoustic pause: surface it and ask Smart Turn to (dis)confirm
                     speaking = False
-                    await websocket.send_json({"type": "speech_stopped"})
+                    last_partial = ""
+                    await websocket.send_json({"type": "speech_pause"})
+                    if turn.speech_triggered:
+                        turn_state, _ = await turn.analyze_end_of_turn()
+                        controller.on_smart_turn(turn_state.name.lower() == "complete")
 
-                if turn_state.name.lower() == "complete" and speech_buffer:
-                    await emit_end_of_turn("vad", metrics)
+                if controller.should_fire():
+                    await fire_thought_end("eou+turn")
                 continue
 
             text_message = message.get("text")
@@ -495,13 +496,14 @@ async def audio_stream(websocket: WebSocket):
 
             action = command.get("type") or command.get("action")
             if action == "reset":
-                speech_buffer.clear()
                 turn.clear()
                 speaking = False
+                last_partial = ""
                 stt_session = await stt.create_stream_session()
+                controller.reset()
                 await websocket.send_json({"type": "reset"})
             elif action in ("commit", "flush"):
-                await emit_end_of_turn("commit")
+                await fire_thought_end("commit")
             elif action == "ping":
                 await websocket.send_json(
                     {"type": "pong", "stt": get_stt().status, "speaking": speaking}

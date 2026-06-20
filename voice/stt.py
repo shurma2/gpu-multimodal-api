@@ -1,9 +1,11 @@
-"""NVIDIA NeMo STT wrapper for Nemotron Speech Streaming EN 0.6B."""
+"""NVIDIA NeMo STT wrapper for Parakeet Realtime EOU 120M (cache-aware streaming
+FastConformer-RNNT with inline <EOU>/<EOB> endpoint markers)."""
 
 from __future__ import annotations
 
 import asyncio
 import os
+import re
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
@@ -104,6 +106,7 @@ class STTEngine:
             ws = max(1, int(sr * ws_chunk_ms / 1000))
             pending = np.zeros(0, dtype=np.float32)
             steps: list[dict[str, Any]] = []
+            finals: list[str] = []
             t_stream = time.time()
             try:
                 for i in range(0, len(audio), ws):
@@ -112,21 +115,28 @@ class STTEngine:
                         block = pending[: session.step_samples]
                         pending = pending[session.step_samples :]
                         t0 = time.time()
-                        txt = session.step_sync(block, is_last=False)
+                        res = session.step_sync(block, is_last=False)
+                        finals.extend(res["finals"])
                         steps.append({"samples": int(block.shape[0]),
                                       "ms": round((time.time() - t0) * 1000, 1),
-                                      "text": txt})
+                                      "partial": res["partial"], "finals": res["finals"],
+                                      "eou": res["eou"], "eob": res["eob"]})
                     if len(steps) >= 200:
                         break
                 t0 = time.time()
-                final = session.step_sync(
+                res = session.step_sync(
                     pending if pending.shape[0] else np.zeros(1, dtype=np.float32),
                     is_last=True,
                 )
+                finals.extend(res["finals"])
                 steps.append({"samples": int(pending.shape[0]), "final": True,
-                              "ms": round((time.time() - t0) * 1000, 1), "text": final})
+                              "ms": round((time.time() - t0) * 1000, 1),
+                              "partial": res["partial"], "finals": res["finals"],
+                              "eou": res["eou"], "eob": res["eob"]})
                 out["stream_ms"] = round((time.time() - t_stream) * 1000, 1)
-                out["streamed_text"] = final
+                out["raw_text"] = res["raw"]  # cumulative hypothesis incl. tokens
+                out["final_segments"] = finals
+                out["streamed_text"] = " ".join(finals).strip()
                 out["steps"] = steps
             except Exception as exc:  # noqa: BLE001
                 out["ok"] = False
@@ -218,7 +228,12 @@ class STTStreamSession:
         self.step_samples = 0
         self.introspection: dict[str, Any] = {}
         self._pending = np.zeros(0, dtype=np.float32)
-        self._text = ""
+        self._text = ""  # full raw running hypothesis (incl. <EOU>/<EOB> tokens)
+        # Endpoint markers emitted inline by Parakeet-EOU. Read from settings so a
+        # token-string correction (validated via /debug/stt-stream) is config-only.
+        self._eou_tokens = tuple(getattr(engine.settings, "stt_eou_tokens", ("<EOU>", "</s>")))
+        self._eob_token = str(getattr(engine.settings, "stt_eob_token", "<EOB>"))
+        self._emitted_segments = 0  # how many closed segments already reported
         self._setup()
 
     def _setup(self) -> None:
@@ -281,7 +296,36 @@ class STTStreamSession:
             self.introspection["setup_traceback"] = traceback.format_exc()
             self.ok = False
 
-    def step_sync(self, samples: np.ndarray, is_last: bool) -> str:
+    def _parse(self, raw: str) -> list[dict[str, Any]]:
+        """Split the cumulative hypothesis into segments delimited by inline
+        endpoint tokens. Returns ordered segments, each:
+            {"text": <stripped>, "kind": "eou" | "eob" | "open"}
+        The trailing "open" segment (if any) is the live partial. Empty closed
+        segments are dropped."""
+        markers = list(self._eou_tokens)
+        if self._eob_token:
+            markers.append(self._eob_token)
+        if not markers:
+            return [{"text": raw.strip(), "kind": "open"}]
+        pattern = re.compile("|".join(re.escape(m) for m in markers))
+        eob = self._eob_token
+        segments: list[dict[str, Any]] = []
+        pos = 0
+        for m in pattern.finditer(raw):
+            text = raw[pos : m.start()].strip()
+            kind = "eob" if m.group(0) == eob else "eou"
+            if text or kind == "eou":
+                segments.append({"text": text, "kind": kind})
+            pos = m.end()
+        tail = raw[pos:].strip()
+        segments.append({"text": tail, "kind": "open"})
+        return segments
+
+    def step_sync(self, samples: np.ndarray, is_last: bool) -> dict[str, Any]:
+        """Run one encoder step and return a structured streaming result:
+            {"partial": str, "finals": list[str], "eou": bool, "eob": bool, "raw": str}
+        `finals` are newly-closed <EOU> segments since the previous step;
+        backchannel <EOB> segments are reported only via the `eob` flag."""
         import torch
 
         model = self._model
@@ -310,40 +354,87 @@ class STTStreamSession:
             )
         item = transcribed[0] if isinstance(transcribed, (list, tuple)) else transcribed
         self._text = str(getattr(item, "text", item))
-        return self._text
+        return self._collect(is_last)
 
-    async def feed(self, audio: np.ndarray) -> None:
-        """Buffer incoming audio and decode whole blocks as they complete."""
+    def _collect(self, is_last: bool) -> dict[str, Any]:
+        """Diff the parsed segments against what we've already reported."""
+        segments = self._parse(self._text)
+        closed = segments[:-1] if segments and segments[-1]["kind"] == "open" else segments
+        partial = segments[-1]["text"] if segments and segments[-1]["kind"] == "open" else ""
+        if is_last and partial:
+            # flush the tail as a final segment even without an explicit token
+            closed = closed + [{"text": partial, "kind": "eou"}]
+            partial = ""
+
+        new = closed[self._emitted_segments :]
+        self._emitted_segments = len(closed)
+        finals = [s["text"] for s in new if s["kind"] == "eou" and s["text"]]
+        return {
+            "partial": partial,
+            "finals": finals,
+            "eou": any(s["kind"] == "eou" for s in new),
+            "eob": any(s["kind"] == "eob" for s in new),
+            "raw": self._text,
+        }
+
+    @staticmethod
+    def _empty_result() -> dict[str, Any]:
+        return {"partial": "", "finals": [], "eou": False, "eob": False, "raw": ""}
+
+    @staticmethod
+    def _merge(acc: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
+        acc["partial"] = step["partial"]
+        acc["finals"].extend(step["finals"])
+        acc["eou"] = acc["eou"] or step["eou"]
+        acc["eob"] = acc["eob"] or step["eob"]
+        acc["raw"] = step["raw"]
+        return acc
+
+    async def feed(self, audio: np.ndarray) -> dict[str, Any]:
+        """Buffer incoming audio and decode whole blocks as they complete.
+        Returns the aggregated streaming result across any blocks run this call."""
+        acc = self._empty_result()
+        acc["partial"] = self._parse(self._text)[-1]["text"] if self.ok else ""
         if not self.ok:
-            return
+            return acc
         self._pending = np.concatenate([self._pending, to_mono_f32(audio)])
         if self._pending.shape[0] < self.step_samples:
-            return
+            return acc
         loop = asyncio.get_running_loop()
         async with self._engine._lock:
             while self._pending.shape[0] >= self.step_samples:
                 block = self._pending[: self.step_samples]
                 self._pending = self._pending[self.step_samples :]
                 try:
-                    await loop.run_in_executor(
+                    step = await loop.run_in_executor(
                         self._engine._executor, self.step_sync, block, False
                     )
                 except Exception as exc:  # noqa: BLE001
                     self.error = f"step: {type(exc).__name__}: {exc}"
                     self.ok = False
-                    return
+                    return acc
+                self._merge(acc, step)
+        return acc
 
-    async def finalize(self) -> str:
-        """Flush the tail and return the final transcript (no full re-decode)."""
+    async def finalize(self) -> dict[str, Any]:
+        """Flush the tail and return the final streaming result (no full re-decode)."""
         if not self.ok:
-            return self._text
+            return self._empty_result()
         loop = asyncio.get_running_loop()
         block = self._pending if self._pending.shape[0] else np.zeros(1, dtype=np.float32)
         self._pending = np.zeros(0, dtype=np.float32)
         async with self._engine._lock:
             try:
-                await loop.run_in_executor(self._engine._executor, self.step_sync, block, True)
+                return await loop.run_in_executor(
+                    self._engine._executor, self.step_sync, block, True
+                )
             except Exception as exc:  # noqa: BLE001
                 self.error = f"final: {type(exc).__name__}: {exc}"
                 self.ok = False
-        return self._text
+        return self._empty_result()
+
+    @property
+    def text(self) -> str:
+        """Full transcript with endpoint tokens stripped (all segments joined)."""
+        segs = [s["text"] for s in self._parse(self._text) if s["kind"] != "eob" and s["text"]]
+        return " ".join(segs).strip()

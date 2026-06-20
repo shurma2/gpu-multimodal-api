@@ -10,9 +10,9 @@ on port `8000`.
 client ──HTTP/WS──► :8000 │  FastAPI gateway (uvicorn)                                        │
                           │    ├─ /v1/chat,/v1/completions ─proxy─► llama-server :8081 (GPU)  │
                           │    ├─ /v1/audio/speech ──────────────► Kokoro TTS   (in-process)  │
-                          │    ├─ /v1/audio/transcriptions ──────► Nemotron STT (in-process)  │
+                          │    ├─ /v1/audio/transcriptions ──────► Parakeet-EOU STT (in-proc) │
                           │    ├─ /v1/audio/vad,/turn ───────────► Silero + Smart Turn (CPU)  │
-                          │    └─ /v1/audio/stream (WebSocket) ──► VAD + turn + STT combined  │
+                          │    └─ /v1/audio/stream (WebSocket) ──► streaming ASR + endpoint   │
                           │  supervisord runs: [llama] + [gateway]                            │
                           └───────────────────────────────────────────────────────────────────┘
 ```
@@ -22,9 +22,9 @@ client ──HTTP/WS──► :8000 │  FastAPI gateway (uvicorn)              
 | Role         | Model                                          | Runtime                    |
 | ------------ | ---------------------------------------------- | -------------------------- |
 | LLM          | `google/gemma-4-12B-it-qat-q4_0-gguf` (Q4_0)   | llama.cpp server, GPU      |
-| STT          | `nvidia/nemotron-speech-streaming-en-0.6b`     | NVIDIA NeMo, GPU           |
+| STT          | `nvidia/parakeet_realtime_eou_120m-v1`         | NVIDIA NeMo, GPU (streaming + `<EOU>`/`<EOB>`) |
 | VAD          | Silero VAD ONNX (bundled with Pipecat)         | CPU                        |
-| End of turn  | Smart Turn v3 ONNX (bundled with Pipecat)      | CPU                        |
+| End of turn  | Smart Turn v3.2 ONNX (bundled with Pipecat)    | CPU                        |
 | TTS          | Kokoro-82M, 24 kHz                             | GPU (CPU optional)         |
 
 Gemma 4 is multimodal, but the LLM is served **text-only** via `--no-mmproj`
@@ -81,9 +81,11 @@ across restarts.
 
 ## The unified streaming channel — `WS /v1/audio/stream`
 
-VAD, end-of-turn detection and STT are bound into **one** WebSocket so a
-consumer never has to correlate three separate signals. The client streams mic
-audio and listens on the same socket for a single decisive `end_of_turn` event.
+Streaming ASR, VAD pauses and Smart Turn are fused into **one** WebSocket. The
+recognizer (Parakeet-EOU) streams text live and emits inline `<EOU>` (end-of-
+utterance) / `<EOB>` (backchannel) markers; Silero VAD supplies acoustic pauses;
+Smart Turn semantically **confirms** an EOU before the channel declares the user
+done with a `thought_end` event.
 
 **Audio format:** raw **PCM16, mono, little-endian, 16 kHz** binary frames
 (announced in the `ready` event). No container/header — just samples.
@@ -93,8 +95,8 @@ audio and listens on the same socket for a single decisive `end_of_turn` event.
 | Frame            | Meaning                                              |
 | ---------------- | ---------------------------------------------------- |
 | binary           | a chunk of PCM16 audio                               |
-| `{"type":"commit"}` | force end-of-turn now (transcribe the buffer)     |
-| `{"type":"reset"}`  | drop the buffered utterance, start fresh          |
+| `{"type":"commit"}` | force `thought_end` now (flush the recognizer)    |
+| `{"type":"reset"}`  | drop the in-progress thought, start fresh         |
 | `{"type":"ping"}`   | liveness/readiness check                          |
 
 **Server → client** (all JSON on the one channel)
@@ -102,18 +104,21 @@ audio and listens on the same socket for a single decisive `end_of_turn` event.
 | Event             | Payload                                                       |
 | ----------------- | ------------------------------------------------------------- |
 | `ready`           | `sample_rate`, `encoding`, `models:{vad,turn,stt}`            |
-| `speech_started`  | VAD detected the user started talking                         |
-| `speech_stopped`  | VAD detected the user went quiet                              |
-| `end_of_turn`     | `text` (final transcript), `complete:true`, `probability`, `processing_ms`, `reason` (`vad`\|`commit`) |
+| `partial_text`    | `text` — live hypothesis for the current segment (tokens stripped) |
+| `speech_pause`    | (no payload) Silero went quiet after speech — acoustic only   |
+| `final_text`      | `text` — one completed `<EOU>` segment (several may precede one `thought_end`) |
+| `thought_end`     | `text` (all segments joined), `segments:[...]`, `reason` (`eou+turn`\|`commit`) |
 | `pong`            | reply to `ping`: `stt` load state, `speaking` flag            |
-| `error`           | `error` message                                               |
+| `error` / `reset` | `error` message / ack of a `reset`                            |
 
-The flow: VAD gates which audio is buffered and emits start/stop; Smart Turn v3
-decides when the **turn** is actually finished (not just a pause); on a complete
-turn the buffered utterance is transcribed by Nemotron and shipped as
-`end_of_turn`. **Receiving `end_of_turn` is the signal to stop listening** and
-hand `text` to the LLM. Nemotron runs as a batch transcription over the
-buffered turn, so there are no interim partials — only the final text.
+The flow: the recognizer streams `partial_text` and, at each `<EOU>`, a
+`final_text` segment. An `<EOU>` is only a **candidate** end-of-thought; when
+Silero reports a pause (`speech_pause`) Smart Turn judges the raw audio and either
+confirms or vetoes it. `thought_end` fires once a candidate is confirmed (or a
+hard max-wait ceiling elapses, so a stubborn "not done" can't hang the turn).
+`<EOB>` backchannels (e.g. "uh-huh") never trigger `thought_end`. **Receiving
+`thought_end` is the signal to stop listening**; accumulate the `final_text`
+segments (or use `thought_end.text`) and hand them to the LLM.
 
 Minimal client:
 
@@ -127,8 +132,10 @@ async def main():
         async def reader():
             async for msg in ws:
                 e = json.loads(msg)
-                if e["type"] == "end_of_turn":
-                    print("USER SAID:", e["text"])  # stop listening, call LLM
+                if e["type"] == "partial_text":
+                    print("…", e["text"])            # live, optional to show
+                elif e["type"] == "thought_end":
+                    print("USER SAID:", e["text"])   # stop listening, call LLM
         asyncio.create_task(reader())
         for chunk in pcm16_chunks_from_mic():        # 16 kHz mono PCM16
             await ws.send(chunk)
@@ -146,10 +153,10 @@ POST /v1/chat/completions        OpenAI-compatible, streams (auth)
 POST /v1/completions             OpenAI-compatible (auth)
 POST /v1/audio/speech            Kokoro TTS, OpenAI-compatible (auth)
 GET  /v1/audio/voices            list Kokoro voices (auth)
-POST /v1/audio/transcriptions    Nemotron STT, multipart file (auth)
+POST /v1/audio/transcriptions    Parakeet-EOU STT, multipart file (auth)
 POST /v1/audio/vad               Silero VAD over an uploaded file (auth)
 POST /v1/audio/turn              Smart Turn over an uploaded file (auth)
-WS   /v1/audio/stream            unified VAD + turn + STT channel (auth)
+WS   /v1/audio/stream            streaming ASR + pause-tolerant end-of-thought (auth)
 POST /v1/voice/chat              messages -> LLM -> TTS audio (auth)
 ```
 
