@@ -76,14 +76,19 @@ class STTEngine:
     def _configure_streaming_decoding(self, model: Any) -> None:
         """Make the RNNT greedy decoder safe for cache-aware streaming.
 
-        Parakeet's default label-looping greedy decoder (`greedy.loop_labels`)
-        produces a *dict* `Hypothesis.timestamp`, and NeMo's streaming
-        chunk-merge (`Hypothesis.merge_`) does `timestamp.extend(...)`, which
-        blows up on a dict. The non-looping greedy path keeps `timestamp` a list
-        and we don't use timestamps anyway, so disable both loop-labels and
-        timestamp computation. Done once at load; best-effort (logged via
-        decoding_config introspection on the engine)."""
+        Cache-aware streaming (`conformer_stream_step`) only works with the
+        label-looping greedy decoder (`greedy.loop_labels=True`); the non-looping
+        path raises NotImplementedError on `partial_hypotheses`. But this NeMo
+        build's label-looping decoder, when it computes timestamps, sets
+        `Hypothesis.timestamp` to a *dict*, and the streaming chunk-merge
+        (`Hypothesis.merge_`) does `timestamp.extend(...)` → crash on a dict.
+
+        So: keep loop_labels=True, turn OFF timestamp/alignment computation
+        (unused here), and install a dict-tolerant `merge_` as a belt-and-braces
+        guard. Done once at load; recorded in `decoding_config` for introspection.
+        """
         self.decoding_config: dict[str, Any] = {}
+        self._patch_hypothesis_merge()
         try:
             from omegaconf import open_dict
 
@@ -93,17 +98,57 @@ class STTEngine:
                 dec.preserve_alignments = False
                 greedy = dec.get("greedy", None)
                 if greedy is not None:
-                    greedy.loop_labels = False
+                    greedy.loop_labels = True  # required for streaming continuation
                     greedy.preserve_alignments = False
+                    greedy.compute_timestamps = False
             model.change_decoding_strategy(dec)
             after = model.cfg.decoding
             self.decoding_config = {
                 "strategy": str(after.get("strategy", "?")),
                 "loop_labels": (after.get("greedy", {}) or {}).get("loop_labels", "?"),
                 "compute_timestamps": after.get("compute_timestamps", "?"),
+                "merge_patched": True,
             }
         except Exception as exc:  # noqa: BLE001
-            self.decoding_config = {"error": f"{type(exc).__name__}: {exc}"}
+            self.decoding_config = {"error": f"{type(exc).__name__}: {exc}", "merge_patched": True}
+
+    @staticmethod
+    def _patch_hypothesis_merge() -> None:
+        """Make `Hypothesis.merge_` tolerate dict/tensor timestamps (idempotent).
+
+        Normalizes both hypotheses' `timestamp` to compatible list form *before*
+        the original merge runs, so the internal `timestamp.extend(...)` can never
+        hit a dict or a tensor/list mismatch. Timestamps are unused downstream of
+        the streaming text, so flattening them is safe."""
+        try:
+            from nemo.collections.asr.parts.utils import rnnt_utils
+        except Exception:  # noqa: BLE001
+            return
+        Hyp = rnnt_utils.Hypothesis
+        if getattr(Hyp.merge_, "_eou_patched", False):
+            return
+        orig = Hyp.merge_
+
+        def _to_list(ts: Any) -> Any:
+            if isinstance(ts, dict):
+                ts = ts.get("timestep", [])
+            try:
+                import torch
+
+                if isinstance(ts, torch.Tensor):
+                    ts = ts.tolist()
+            except Exception:  # noqa: BLE001
+                pass
+            return ts
+
+        def merge_(self, other):  # type: ignore[no-untyped-def]
+            self.timestamp = _to_list(getattr(self, "timestamp", None))
+            if other is not None:
+                other.timestamp = _to_list(getattr(other, "timestamp", None))
+            return orig(self, other)
+
+        merge_._eou_patched = True  # type: ignore[attr-defined]
+        Hyp.merge_ = merge_
 
     async def create_stream_session(self) -> "STTStreamSession":
         """Per-connection cache-aware streaming decoder. Falls back silently
