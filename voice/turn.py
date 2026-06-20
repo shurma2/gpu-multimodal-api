@@ -79,6 +79,16 @@ class VADTurnService:
             "states": states,
         }
 
+    async def predict_endpoint(self, analyzer, audio) -> bool:
+        """Run Smart Turn directly on a float audio array (16 kHz), bypassing the
+        pipecat speech-triggered state machine. Used to confirm a Parakeet <EOU>
+        candidate on demand, since the EOU can land after Silero's pause."""
+        if audio is None or len(audio) == 0:
+            return False
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(self._executor, analyzer._predict_endpoint, audio)
+        return bool(result.get("prediction") == 1)
+
     async def predict_turn_bytes(self, data: bytes) -> dict[str, Any]:
         audio, sr = decode_audio_bytes(data, target_sr=self.settings.vad_sample_rate)
         analyzer = self.create_turn_analyzer(sr)

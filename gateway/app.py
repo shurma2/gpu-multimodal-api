@@ -470,17 +470,22 @@ async def audio_stream(websocket: WebSocket):
                         if seg:
                             await websocket.send_json({"type": "final_text", "text": seg})
 
-                    turn.append_audio(chunk, is_speech)
+                    # A Parakeet <EOU> is a candidate end-of-thought. Confirm it
+                    # with Smart Turn right now, on the utterance audio — the EOU
+                    # often lands after Silero's pause, so we can't rely on the
+                    # pause to (re)trigger the check.
+                    if result["eou"]:
+                        confirmed = await service.predict_endpoint(
+                            turn, stt_session.tail_audio(settings.turn_max_duration_secs)
+                        )
+                        controller.on_smart_turn(confirmed)
+
                     if is_speech:
                         speaking = True
                     elif speaking and vad_name == "quiet":
-                        # acoustic pause: surface it, ask Smart Turn to (dis)confirm
                         speaking = False
                         last_partial = ""
                         await websocket.send_json({"type": "speech_pause"})
-                        if turn.speech_triggered:
-                            turn_state, _ = await turn.analyze_end_of_turn()
-                            controller.on_smart_turn(turn_state.name.lower() == "complete")
 
                     if controller.should_fire():
                         await fire_thought_end("eou+turn")

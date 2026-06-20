@@ -583,3 +583,8 @@ class STTStreamSession:
         """Full transcript with endpoint tokens stripped (all segments joined)."""
         segs = [s["text"] for s in self._parse(self._text) if s["kind"] != "eob" and s["text"]]
         return " ".join(segs).strip()
+
+    def tail_audio(self, seconds: float) -> np.ndarray:
+        """Last `seconds` of the turn audio — for an on-demand Smart Turn check."""
+        n = int(seconds * self._sr)
+        return self._raw[-n:] if n and self._raw.shape[0] > n else self._raw
