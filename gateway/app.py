@@ -416,7 +416,7 @@ async def audio_stream(websocket: WebSocket):
     stt_session = await stt.create_stream_session()
     controller = EndpointController(settings)
 
-    async def fire_thought_end(reason: str) -> None:
+    async def fire_thought_end(reason: str, allow_empty: bool = True) -> None:
         nonlocal speaking, stt_session, last_partial
         # flush the tail of the recognizer so any open segment is finalized
         result = await stt_session.finalize()
@@ -424,7 +424,10 @@ async def audio_stream(websocket: WebSocket):
         for seg in result["finals"]:
             if seg:
                 await websocket.send_json({"type": "final_text", "text": seg})
-        await websocket.send_json(controller.take_thought_end(reason))
+        payload = controller.take_thought_end(reason)
+        # a commit on an already-finished turn carries nothing — don't emit it
+        if allow_empty or payload["segments"] or payload["text"]:
+            await websocket.send_json(payload)
         turn.clear()
         speaking = False
         last_partial = ""
@@ -513,7 +516,7 @@ async def audio_stream(websocket: WebSocket):
                 controller.reset()
                 await websocket.send_json({"type": "reset"})
             elif action in ("commit", "flush"):
-                await fire_thought_end("commit")
+                await fire_thought_end("commit", allow_empty=False)
             elif action == "ping":
                 await websocket.send_json(
                     {"type": "pong", "stt": get_stt().status, "speaking": speaking}

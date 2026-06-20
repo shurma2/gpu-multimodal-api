@@ -537,26 +537,33 @@ class STTStreamSession:
         return acc
 
     def finalize_sync(self) -> dict[str, Any]:
-        """Decode any remaining tail frames as the final (keep_all_outputs) step."""
+        """Decode any remaining tail frames as the final (keep_all_outputs) step.
+
+        Pads with trailing silence first: this both lets the model emit a closing
+        <EOU> and gives the RNNT decoder fresh frames to flush its last token even
+        when `feed` already consumed every real frame as full (non-last) chunks —
+        otherwise a short, fully-consumed utterance (one-word reply) decodes empty."""
         acc = self._empty_result()
         if not self.ok:
             acc["partial"] = self._parse(self._text)[-1]["text"]
             return acc
         try:
-            if self._raw.shape[0] > 0:
-                self._preprocess_all()
-                total = self._feat.size(-1)
-                if self._buf_idx < total:
-                    first = self._step == 0
-                    chunk = self._make_chunk(self._buf_idx, total, first)
-                    step = self._run_chunk(chunk, 0 if first else self._drop, is_last=True)
-                    self._merge(acc, step)
-                    self._buf_idx = total
-                    self._step += 1
-                else:
-                    self._merge(acc, self._collect(is_last=True))
-            else:
+            if self._raw.shape[0] == 0:
                 self._merge(acc, self._collect(is_last=True))
+                return acc
+            pad = np.zeros(int(0.2 * self._sr), dtype=np.float32)
+            self._raw = np.concatenate([self._raw, pad])
+            self._preprocess_all()
+            total = self._feat.size(-1)
+            while self._buf_idx < total:
+                first = self._step == 0
+                cs = self._pick(self._chunk_size, first)
+                end = min(self._buf_idx + cs, total)
+                chunk = self._make_chunk(self._buf_idx, end, first)
+                step = self._run_chunk(chunk, 0 if first else self._drop, is_last=(end >= total))
+                self._merge(acc, step)
+                self._buf_idx = end
+                self._step += 1
         except Exception as exc:  # noqa: BLE001
             import traceback
             self.error = f"final: {type(exc).__name__}: {exc}"
