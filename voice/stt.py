@@ -70,7 +70,40 @@ class STTEngine:
         model.eval()
         if self.device:
             model = model.to(self.device)
+        self._configure_streaming_decoding(model)
         return model
+
+    def _configure_streaming_decoding(self, model: Any) -> None:
+        """Make the RNNT greedy decoder safe for cache-aware streaming.
+
+        Parakeet's default label-looping greedy decoder (`greedy.loop_labels`)
+        produces a *dict* `Hypothesis.timestamp`, and NeMo's streaming
+        chunk-merge (`Hypothesis.merge_`) does `timestamp.extend(...)`, which
+        blows up on a dict. The non-looping greedy path keeps `timestamp` a list
+        and we don't use timestamps anyway, so disable both loop-labels and
+        timestamp computation. Done once at load; best-effort (logged via
+        decoding_config introspection on the engine)."""
+        self.decoding_config: dict[str, Any] = {}
+        try:
+            from omegaconf import open_dict
+
+            dec = model.cfg.decoding
+            with open_dict(dec):
+                dec.compute_timestamps = False
+                dec.preserve_alignments = False
+                greedy = dec.get("greedy", None)
+                if greedy is not None:
+                    greedy.loop_labels = False
+                    greedy.preserve_alignments = False
+            model.change_decoding_strategy(dec)
+            after = model.cfg.decoding
+            self.decoding_config = {
+                "strategy": str(after.get("strategy", "?")),
+                "loop_labels": (after.get("greedy", {}) or {}).get("loop_labels", "?"),
+                "compute_timestamps": after.get("compute_timestamps", "?"),
+            }
+        except Exception as exc:  # noqa: BLE001
+            self.decoding_config = {"error": f"{type(exc).__name__}: {exc}"}
 
     async def create_stream_session(self) -> "STTStreamSession":
         """Per-connection cache-aware streaming decoder. Falls back silently
@@ -96,6 +129,7 @@ class STTEngine:
         import traceback
 
         out: dict[str, Any] = {"audio_seconds": round(len(audio) / float(sr), 3)}
+        out["decoding_config"] = getattr(self, "decoding_config", {})
         session = STTStreamSession(self)
         out["introspection"] = session.introspection
         out["ok"] = session.ok
