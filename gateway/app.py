@@ -453,36 +453,41 @@ async def audio_stream(websocket: WebSocket):
             if chunk is not None:
                 if not chunk:
                     continue
-                vad_state = await vad.analyze_audio(chunk)
-                vad_name = vad_state.name.lower()
-                is_speech = vad_name in ("starting", "speaking", "stopping")
+                try:
+                    vad_state = await vad.analyze_audio(chunk)
+                    vad_name = vad_state.name.lower()
+                    is_speech = vad_name in ("starting", "speaking", "stopping")
 
-                # Recognizer runs on every frame; EOU detection needs the pause.
-                result = await stt_session.feed(pcm16_bytes_to_float(chunk))
-                controller.ingest_stream(result)
-                if result["partial"] and result["partial"] != last_partial:
-                    last_partial = result["partial"]
+                    # Recognizer runs on every frame; EOU detection needs the pause.
+                    result = await stt_session.feed(pcm16_bytes_to_float(chunk))
+                    controller.ingest_stream(result)
+                    if result["partial"] and result["partial"] != last_partial:
+                        last_partial = result["partial"]
+                        await websocket.send_json(
+                            {"type": "partial_text", "text": result["partial"]}
+                        )
+                    for seg in result["finals"]:
+                        if seg:
+                            await websocket.send_json({"type": "final_text", "text": seg})
+
+                    turn.append_audio(chunk, is_speech)
+                    if is_speech:
+                        speaking = True
+                    elif speaking and vad_name == "quiet":
+                        # acoustic pause: surface it, ask Smart Turn to (dis)confirm
+                        speaking = False
+                        last_partial = ""
+                        await websocket.send_json({"type": "speech_pause"})
+                        if turn.speech_triggered:
+                            turn_state, _ = await turn.analyze_end_of_turn()
+                            controller.on_smart_turn(turn_state.name.lower() == "complete")
+
+                    if controller.should_fire():
+                        await fire_thought_end("eou+turn")
+                except Exception as exc:  # noqa: BLE001 — don't drop the socket on one bad frame
                     await websocket.send_json(
-                        {"type": "partial_text", "text": result["partial"]}
+                        {"type": "error", "error": f"{type(exc).__name__}: {exc}"}
                     )
-                for seg in result["finals"]:
-                    if seg:
-                        await websocket.send_json({"type": "final_text", "text": seg})
-
-                turn.append_audio(chunk, is_speech)
-                if is_speech:
-                    speaking = True
-                elif speaking and vad_name == "quiet":
-                    # acoustic pause: surface it and ask Smart Turn to (dis)confirm
-                    speaking = False
-                    last_partial = ""
-                    await websocket.send_json({"type": "speech_pause"})
-                    if turn.speech_triggered:
-                        turn_state, _ = await turn.analyze_end_of_turn()
-                        controller.on_smart_turn(turn_state.name.lower() == "complete")
-
-                if controller.should_fire():
-                    await fire_thought_end("eou+turn")
                 continue
 
             text_message = message.get("text")

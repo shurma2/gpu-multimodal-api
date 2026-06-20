@@ -35,7 +35,7 @@ class VADTurnService:
         from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
         from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 
-        return LocalSmartTurnAnalyzerV3(
+        analyzer = LocalSmartTurnAnalyzerV3(
             sample_rate=sample_rate,
             cpu_count=self.settings.turn_cpu_count,
             params=SmartTurnParams(
@@ -44,6 +44,10 @@ class VADTurnService:
                 max_duration_secs=self.settings.turn_max_duration_secs,
             ),
         )
+        # The constructor arg isn't applied until set_sample_rate runs; without
+        # this `_sample_rate` stays 0 and append_audio divides by zero.
+        analyzer.set_sample_rate(sample_rate)
+        return analyzer
 
     async def analyze_vad_bytes(self, data: bytes) -> dict[str, Any]:
         from pipecat.audio.vad.vad_analyzer import VADState
